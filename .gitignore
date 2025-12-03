@@ -1,0 +1,16 @@
+# Local data / static files
+data/
+logs/
+backups/
+
+# Env / secrets
+.env
+*.env
+secrets/
+*.secret
+
+# Editors / OS junk
+.vscode/
+.idea/
+*.swp
+.DS_Store
