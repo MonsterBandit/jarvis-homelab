@@ -1,9 +1,13 @@
+import os
 import time
 import socket
 from datetime import datetime, timezone
 
 import psutil
-from fastapi import FastAPI
+import requests
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 app = FastAPI(
     title="Jarvis Brain",
@@ -11,8 +15,26 @@ app = FastAPI(
     version="0.1.0",
 )
 
+# CORS: allow browser apps (Jarvis UI) to call this API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # you can restrict this later to your domains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # record when the service started (for uptime)
 START_TIME = time.time()
+
+# LLM config from environment
+LLM_API_KEY = os.getenv("JARVIS_LLM_API_KEY")
+LLM_BASE_URL = os.getenv("JARVIS_LLM_BASE_URL", "https://api.openai.com/v1")
+LLM_MODEL = os.getenv("JARVIS_LLM_MODEL", "gpt-4o-mini")
+
+
+class AskRequest(BaseModel):
+    message: str
 
 
 @app.get("/health")
@@ -84,4 +106,56 @@ def uptime():
         "service_uptime_seconds": int(service_uptime_seconds),
         "host_uptime_seconds": int(host_uptime_seconds),
         "host_boot_time_utc": boot_time.isoformat(),
+    }
+
+
+@app.post("/ask")
+def ask_jarvis(body: AskRequest):
+    """
+    Proxy a simple question to an OpenAI-compatible LLM and return the answer.
+    """
+    if not LLM_API_KEY:
+        raise HTTPException(status_code=500, detail="LLM API key not configured.")
+
+    url = f"{LLM_BASE_URL.rstrip('/')}/chat/completions"
+
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are Jarvis, a helpful personal assistant for the user's homelab. "
+                           "Be concise and practical.",
+            },
+            {
+                "role": "user",
+                "content": body.message,
+            },
+        ],
+        "temperature": 0.5,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Error contacting LLM provider: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+    data = resp.json()
+
+    try:
+        answer = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise HTTPException(status_code=500, detail="Unexpected response from LLM provider.")
+
+    return {
+        "model": LLM_MODEL,
+        "answer": answer,
     }
