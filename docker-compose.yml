@@ -1,0 +1,20 @@
+services:
+  jarvis-agent:
+    image: nginx:alpine
+    container_name: jarvis-agent
+    restart: unless-stopped
+
+    volumes:
+      # simple static site content (you can drop an index.html in here later)
+      - /opt/jarvis/data:/usr/share/nginx/html:ro
+
+    networks:
+      - jarvis_net
+
+    # internal port only; NPM will forward to this
+    expose:
+      - "80"
+
+networks:
+  jarvis_net:
+    external: true
