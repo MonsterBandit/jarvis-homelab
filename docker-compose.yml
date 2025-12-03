@@ -14,6 +14,16 @@ services:
     # internal port only; NPM will forward to this
     expose:
       - "80"
+##
+##
+  jarvis-brain:
+    build: ./brain
+    container_name: jarvis-brain
+    restart: unless-stopped
+    networks:
+      - jarvis_net
+    expose:
+      - "8000"
 
 networks:
   jarvis_net:
