@@ -24,6 +24,8 @@ services:
       - jarvis_net
     expose:
       - "8000"
+    volumes:
+      - /opt/jarvis/brain-data:/app/data
     environment:
       # OpenAI-compatible config
       JARVIS_LLM_API_KEY: ${JARVIS_LLM_API_KEY}

@@ -1,6 +1,8 @@
 import os
 import time
 import socket
+import sqlite3
+from pathlib import Path
 from datetime import datetime, timezone
 
 import psutil
@@ -12,13 +14,13 @@ from pydantic import BaseModel
 app = FastAPI(
     title="Jarvis Brain",
     description="Backend API for your personal Jarvis assistant",
-    version="0.1.0",
+    version="0.2.0",
 )
 
-# CORS: allow browser apps (Jarvis UI) to call this API
+# CORS so the web UI can talk to us
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can restrict this later to your domains
+    allow_origins=["*"],  # you can lock this down to your domains later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -27,7 +29,75 @@ app.add_middleware(
 # record when the service started (for uptime)
 START_TIME = time.time()
 
-# LLM config from environment
+# ---- Database setup (for conversation history) ----
+
+DATA_DIR = Path("/app/data")
+DB_PATH = DATA_DIR / "jarvis_brain.db"
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_db_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts_utc TEXT NOT NULL,
+            model TEXT NOT NULL,
+            user_message TEXT NOT NULL,
+            jarvis_answer TEXT NOT NULL
+        )
+        """
+    )
+    return conn
+
+
+def log_conversation(model: str, message: str, answer: str) -> None:
+    ts = datetime.now(timezone.utc).isoformat()
+    conn = get_db_conn()
+    try:
+        conn.execute(
+            "INSERT INTO conversations (ts_utc, model, user_message, jarvis_answer) VALUES (?, ?, ?, ?)",
+            (ts, model, message, answer),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fetch_recent_conversations(limit: int = 20):
+    conn = get_db_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT id, ts_utc, model, user_message, jarvis_answer
+            FROM conversations
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    # newest last for nicer display
+    rows.reverse()
+    return [
+        {
+            "id": row[0],
+            "ts_utc": row[1],
+            "model": row[2],
+            "user_message": row[3],
+            "jarvis_answer": row[4],
+        }
+        for row in rows
+    ]
+
+
+# ---- LLM config ----
+
 LLM_API_KEY = os.getenv("JARVIS_LLM_API_KEY")
 LLM_BASE_URL = os.getenv("JARVIS_LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_MODEL = os.getenv("JARVIS_LLM_MODEL", "gpt-4o-mini")
@@ -50,7 +120,7 @@ def whoami():
         "name": "Jarvis",
         "role": "Personal homelab assistant",
         "host": socket.gethostname(),
-        "version": "0.1.0",
+        "version": "0.2.0",
         "description": "I run in your homelab and help you monitor, automate, and query your systems.",
     }
 
@@ -59,7 +129,6 @@ def whoami():
 def current_time():
     """Return the current server time in UTC and local."""
     now_utc = datetime.now(timezone.utc)
-    # naive local time (server's timezone)
     now_local = datetime.now()
     return {
         "utc_iso": now_utc.isoformat(),
@@ -75,9 +144,7 @@ def system_info():
     disk = psutil.disk_usage("/")
 
     return {
-        "cpu": {
-            "percent": cpu_percent,
-        },
+        "cpu": {"percent": cpu_percent},
         "memory": {
             "total_bytes": virtual_mem.total,
             "used_bytes": virtual_mem.used,
@@ -113,6 +180,7 @@ def uptime():
 def ask_jarvis(body: AskRequest):
     """
     Proxy a simple question to an OpenAI-compatible LLM and return the answer.
+    Also logs the exchange in SQLite.
     """
     if not LLM_API_KEY:
         raise HTTPException(status_code=500, detail="LLM API key not configured.")
@@ -124,13 +192,12 @@ def ask_jarvis(body: AskRequest):
         "messages": [
             {
                 "role": "system",
-                "content": "You are Jarvis, a helpful personal assistant for the user's homelab. "
-                           "Be concise and practical.",
+                "content": (
+                    "You are Jarvis, a helpful personal assistant for the user's homelab. "
+                    "Be concise and practical."
+                ),
             },
-            {
-                "role": "user",
-                "content": body.message,
-            },
+            {"role": "user", "content": body.message},
         ],
         "temperature": 0.5,
     }
@@ -155,7 +222,20 @@ def ask_jarvis(body: AskRequest):
     except (KeyError, IndexError, TypeError):
         raise HTTPException(status_code=500, detail="Unexpected response from LLM provider.")
 
-    return {
-        "model": LLM_MODEL,
-        "answer": answer,
-    }
+    # log to SQLite
+    try:
+        log_conversation(LLM_MODEL, body.message, answer)
+    except Exception as e:
+        # don't break the API if logging fails; just note it
+        print(f"[WARN] Failed to log conversation: {e}")
+
+    return {"model": LLM_MODEL, "answer": answer}
+
+
+@app.get("/history")
+def history(limit: int = 20):
+    """
+    Return the most recent conversation entries (user question + Jarvis reply).
+    """
+    items = fetch_recent_conversations(limit=limit)
+    return {"count": len(items), "items": items}

@@ -14,3 +14,10 @@ secrets/
 .idea/
 *.swp
 .DS_Store
+
+# Runtime / data directories
+brain-data/
+data/temp/
+*.db
+*.sqlite
+__pycache__/
