@@ -31,6 +31,8 @@ services:
       JARVIS_LLM_API_KEY: ${JARVIS_LLM_API_KEY}
       JARVIS_LLM_BASE_URL: ${JARVIS_LLM_BASE_URL:-https://api.openai.com/v1}
       JARVIS_LLM_MODEL: ${JARVIS_LLM_MODEL:-gpt-4o-mini}
+      HOMEASSISTANT_BASE_URL: ${HOMEASSISTANT_BASE_URL}
+      HOMEASSISTANT_TOKEN: ${HOMEASSISTANT_TOKEN}
 
 networks:
   jarvis_net:

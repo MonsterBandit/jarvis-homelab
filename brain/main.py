@@ -1,15 +1,28 @@
+from __future__ import annotations
+
 import os
-import time
 import socket
 import sqlite3
-from pathlib import Path
+import time
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import psutil
-import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from model_client import (
+    OpenAICompatibleClient,
+    GeminiModelClient,
+    ModelClientError,
+)
+from services.homeassistant import HomeAssistantClient, HomeAssistantConfig
+
+# -----------------------------------------------------------------------------
+# FastAPI app
+# -----------------------------------------------------------------------------
 
 app = FastAPI(
     title="Jarvis Brain",
@@ -17,19 +30,21 @@ app = FastAPI(
     version="0.2.0",
 )
 
-# CORS so the web UI can talk to us
+# Allow the web UI (jarvis-agent / NGINX front) to call us
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can lock this down to your domains later
+    allow_origins=["*"],  # you can lock this down to specific domains later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# record when the service started (for uptime)
+# Record when the service started (for uptime)
 START_TIME = time.time()
 
-# ---- Database setup (for conversation history) ----
+# -----------------------------------------------------------------------------
+# Database setup (for conversation history)
+# -----------------------------------------------------------------------------
 
 DATA_DIR = Path("/app/data")
 DB_PATH = DATA_DIR / "jarvis_brain.db"
@@ -37,7 +52,7 @@ DB_PATH = DATA_DIR / "jarvis_brain.db"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def get_db_conn():
+def get_db_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
@@ -58,7 +73,8 @@ def log_conversation(model: str, message: str, answer: str) -> None:
     conn = get_db_conn()
     try:
         conn.execute(
-            "INSERT INTO conversations (ts_utc, model, user_message, jarvis_answer) VALUES (?, ?, ?, ?)",
+            "INSERT INTO conversations (ts_utc, model, user_message, jarvis_answer) "
+            "VALUES (?, ?, ?, ?)",
             (ts, model, message, answer),
         )
         conn.commit()
@@ -66,7 +82,7 @@ def log_conversation(model: str, message: str, answer: str) -> None:
         conn.close()
 
 
-def fetch_recent_conversations(limit: int = 20):
+def fetch_recent_conversations(limit: int = 20) -> List[Dict[str, Any]]:
     conn = get_db_conn()
     try:
         cur = conn.execute(
@@ -96,37 +112,97 @@ def fetch_recent_conversations(limit: int = 20):
     ]
 
 
-# ---- LLM config ----
+# -----------------------------------------------------------------------------
+# LLM client configuration (model-agnostic brain)
+# -----------------------------------------------------------------------------
 
 LLM_API_KEY = os.getenv("JARVIS_LLM_API_KEY")
 LLM_BASE_URL = os.getenv("JARVIS_LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_MODEL = os.getenv("JARVIS_LLM_MODEL", "gpt-4o-mini")
 
+LLM_PROVIDER = os.getenv("JARVIS_LLM_PROVIDER", "openai").lower()
+
+if not LLM_API_KEY:
+    raise RuntimeError("JARVIS_LLM_API_KEY must be set in the environment.")
+
+if LLM_PROVIDER == "openai":
+    model_client = OpenAICompatibleClient(
+        base_url=LLM_BASE_URL,
+        api_key=LLM_API_KEY,
+        model=LLM_MODEL,
+    )
+elif LLM_PROVIDER == "gemini":
+    # NOTE: This will raise a clear ModelClientError if someone
+    # actually tries to use it before we implement the HTTP calls.
+    model_client = GeminiModelClient(
+        api_key=LLM_API_KEY,
+        model=LLM_MODEL,
+    )
+else:
+    raise RuntimeError(f"Unsupported JARVIS_LLM_PROVIDER: {LLM_PROVIDER}")
+
+
+# -----------------------------------------------------------------------------
+# Home Assistant client configuration
+# -----------------------------------------------------------------------------
+
+HA_BASE_URL = os.getenv("HOMEASSISTANT_BASE_URL")
+HA_TOKEN = os.getenv("HOMEASSISTANT_TOKEN")
+
+
+def create_ha_client() -> Optional[HomeAssistantClient]:
+    """
+    Build a HomeAssistantClient from environment variables.
+
+    Returns None if Home Assistant is not configured.
+    """
+    if not HA_BASE_URL or not HA_TOKEN:
+        return None
+
+    config = HomeAssistantConfig(
+        base_url=HA_BASE_URL,
+        token=HA_TOKEN,
+        timeout=5.0,
+    )
+    return HomeAssistantClient(config)
+
+
+app.state.ha_client = create_ha_client()
+
+# -----------------------------------------------------------------------------
+# Pydantic models
+# -----------------------------------------------------------------------------
 
 class AskRequest(BaseModel):
     message: str
 
 
+# -----------------------------------------------------------------------------
+# Basic health & identity endpoints
+# -----------------------------------------------------------------------------
+
 @app.get("/health")
-def health():
+def health() -> Dict[str, Any]:
     """Simple health check endpoint."""
     return {"status": "ok", "service": "jarvis-brain"}
 
 
 @app.get("/whoami")
-def whoami():
+def whoami() -> Dict[str, Any]:
     """Basic identity endpoint for Jarvis."""
     return {
         "name": "Jarvis",
         "role": "Personal homelab assistant",
         "host": socket.gethostname(),
         "version": "0.2.0",
-        "description": "I run in your homelab and help you monitor, automate, and query your systems.",
+        "description": (
+            "I run in your homelab and help you monitor, automate, and query your systems."
+        ),
     }
 
 
 @app.get("/time")
-def current_time():
+def current_time() -> Dict[str, Any]:
     """Return the current server time in UTC and local."""
     now_utc = datetime.now(timezone.utc)
     now_local = datetime.now()
@@ -137,7 +213,7 @@ def current_time():
 
 
 @app.get("/system-info")
-def system_info():
+def system_info() -> Dict[str, Any]:
     """Return basic system metrics from the host."""
     cpu_percent = psutil.cpu_percent(interval=0.5)
     virtual_mem = psutil.virtual_memory()
@@ -162,7 +238,7 @@ def system_info():
 
 
 @app.get("/uptime")
-def uptime():
+def uptime() -> Dict[str, Any]:
     """How long jarvis-brain has been running (and basic host uptime)."""
     service_uptime_seconds = time.time() - START_TIME
 
@@ -176,56 +252,79 @@ def uptime():
     }
 
 
-@app.post("/ask")
-def ask_jarvis(body: AskRequest):
+# -----------------------------------------------------------------------------
+# Home Assistant endpoints
+# -----------------------------------------------------------------------------
+
+@app.get("/homeassistant/health")
+async def homeassistant_health() -> Dict[str, Any]:
     """
-    Proxy a simple question to an OpenAI-compatible LLM and return the answer.
+    Health check for Home Assistant connectivity.
+
+    Uses the HomeAssistantClient to call HA's /api/ endpoint.
+    """
+    client = getattr(app.state, "ha_client", None)
+    if client is None:
+        return {
+            "status": "disabled",
+            "reason": (
+                "Home Assistant not configured "
+                "(missing HOMEASSISTANT_BASE_URL or HOMEASSISTANT_TOKEN)"
+            ),
+        }
+
+    ok, details = client.health()
+    return {
+        "status": "ok" if ok else "error",
+        "details": details,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Core ask/history endpoints
+# -----------------------------------------------------------------------------
+
+@app.post("/ask")
+def ask_jarvis(body: AskRequest) -> Dict[str, Any]:
+    """
+    Proxy a simple question to a model backend and return the answer.
     Also logs the exchange in SQLite.
     """
-    if not LLM_API_KEY:
-        raise HTTPException(status_code=500, detail="LLM API key not configured.")
+    # Prepare messages (unchanged logic, just made explicit)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are Jarvis, a helpful personal assistant for the user's homelab. "
+                "Be concise and practical."
+            ),
+        },
+        {"role": "user", "content": body.message},
+    ]
 
-    url = f"{LLM_BASE_URL.rstrip('/')}/chat/completions"
-
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are Jarvis, a helpful personal assistant for the user's homelab. "
-                    "Be concise and practical."
-                ),
-            },
-            {"role": "user", "content": body.message},
-        ],
-        "temperature": 0.5,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
+    # Call through the model client instead of using requests directly
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=30)
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Error contacting LLM provider: {e}")
+        data = model_client.chat(
+            messages=messages,
+            temperature=0.5,
+        )
+    except ModelClientError as e:
+        # Uniform error surface for anything in the model backend
+        raise HTTPException(status_code=502, detail=str(e))
 
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-
-    data = resp.json()
-
+    # Extract answer like before
     try:
         answer = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
-        raise HTTPException(status_code=500, detail="Unexpected response from LLM provider.")
+        raise HTTPException(
+            status_code=500,
+            detail="Unexpected response from LLM provider.",
+        )
 
-    # log to SQLite
+    # Log to SQLite (unchanged)
     try:
         log_conversation(LLM_MODEL, body.message, answer)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         # don't break the API if logging fails; just note it
         print(f"[WARN] Failed to log conversation: {e}")
 
@@ -233,7 +332,7 @@ def ask_jarvis(body: AskRequest):
 
 
 @app.get("/history")
-def history(limit: int = 20):
+def history(limit: int = 20) -> Dict[str, Any]:
     """
     Return the most recent conversation entries (user question + Jarvis reply).
     """
