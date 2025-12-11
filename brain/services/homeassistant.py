@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 
@@ -68,6 +68,68 @@ class HomeAssistantClient:
         return ok, {
             "status_code": resp.status_code,
             "body": data,
+            "url": url,
+        }
+
+    # =========================
+    # New Phase 5.3 methods
+    # =========================
+
+    def list_states(self) -> List[Dict[str, Any]]:
+        """
+        Return all entity states from Home Assistant (`GET /api/states`).
+        """
+        url = self._build_url("/states")
+        resp = self._session.get(url, timeout=self.config.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_state(self, entity_id: str) -> Dict[str, Any]:
+        """
+        Return the state for a single entity (`GET /api/states/{entity_id}`).
+        """
+        path = f"/states/{entity_id}"
+        url = self._build_url(path)
+        resp = self._session.get(url, timeout=self.config.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def call_service(
+        self,
+        domain: str,
+        service: str,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Call a Home Assistant service (`POST /api/services/{domain}/{service}`).
+
+        Args:
+            domain: e.g. "light", "switch", "script"
+            service: e.g. "turn_on", "turn_off"
+            data: payload dict passed through to Home Assistant.
+
+        Returns:
+            dict with status_code, body, and url.
+        """
+        path = f"/services/{domain}/{service}"
+        url = self._build_url(path)
+        payload: Dict[str, Any] = data or {}
+
+        resp = self._session.post(
+            url,
+            json=payload,
+            timeout=self.config.timeout,
+        )
+        resp.raise_for_status()
+
+        try:
+            body: Any = resp.json()
+        except Exception:  # noqa: BLE001
+            body = resp.text
+
+        return {
+            "status_code": resp.status_code,
+            "body": body,
             "url": url,
         }
 

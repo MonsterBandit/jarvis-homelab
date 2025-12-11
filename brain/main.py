@@ -20,9 +20,10 @@ from model_client import (
 )
 from services.homeassistant import HomeAssistantClient, HomeAssistantConfig
 
-# -----------------------------------------------------------------------------
+
+# ---------------------------------------------------------
 # FastAPI app
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------
 
 app = FastAPI(
     title="Jarvis Brain",
@@ -42,9 +43,10 @@ app.add_middleware(
 # Record when the service started (for uptime)
 START_TIME = time.time()
 
-# -----------------------------------------------------------------------------
+
+# ---------------------------------------------------------
 # Database setup (for conversation history)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------
 
 DATA_DIR = Path("/app/data")
 DB_PATH = DATA_DIR / "jarvis_brain.db"
@@ -73,8 +75,10 @@ def log_conversation(model: str, message: str, answer: str) -> None:
     conn = get_db_conn()
     try:
         conn.execute(
-            "INSERT INTO conversations (ts_utc, model, user_message, jarvis_answer) "
-            "VALUES (?, ?, ?, ?)",
+            """
+            INSERT INTO conversations (ts_utc, model, user_message, jarvis_answer)
+            VALUES (?, ?, ?, ?)
+            """,
             (ts, model, message, answer),
         )
         conn.commit()
@@ -112,14 +116,13 @@ def fetch_recent_conversations(limit: int = 20) -> List[Dict[str, Any]]:
     ]
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------
 # LLM client configuration (model-agnostic brain)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------
 
 LLM_API_KEY = os.getenv("JARVIS_LLM_API_KEY")
 LLM_BASE_URL = os.getenv("JARVIS_LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_MODEL = os.getenv("JARVIS_LLM_MODEL", "gpt-4o-mini")
-
 LLM_PROVIDER = os.getenv("JARVIS_LLM_PROVIDER", "openai").lower()
 
 if not LLM_API_KEY:
@@ -142,9 +145,9 @@ else:
     raise RuntimeError(f"Unsupported JARVIS_LLM_PROVIDER: {LLM_PROVIDER}")
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------
 # Home Assistant client configuration
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------
 
 HA_BASE_URL = os.getenv("HOMEASSISTANT_BASE_URL")
 HA_TOKEN = os.getenv("HOMEASSISTANT_TOKEN")
@@ -169,17 +172,18 @@ def create_ha_client() -> Optional[HomeAssistantClient]:
 
 app.state.ha_client = create_ha_client()
 
-# -----------------------------------------------------------------------------
+
+# ---------------------------------------------------------
 # Pydantic models
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------
 
 class AskRequest(BaseModel):
     message: str
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------
 # Basic health & identity endpoints
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
@@ -232,7 +236,6 @@ def system_info() -> Dict[str, Any]:
             "used_bytes": disk.used,
             "free_bytes": disk.free,
             "percent": disk.percent,
-            "mountpoint": "/",
         },
     }
 
@@ -252,9 +255,9 @@ def uptime() -> Dict[str, Any]:
     }
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------
 # Home Assistant endpoints
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------
 
 @app.get("/homeassistant/health")
 async def homeassistant_health() -> Dict[str, Any]:
@@ -280,9 +283,95 @@ async def homeassistant_health() -> Dict[str, Any]:
     }
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------
+# Home Assistant States & Services
+# ---------------------------------------------------------
+
+@app.get("/homeassistant/states")
+async def ha_list_states() -> Dict[str, Any]:
+    """
+    Return all entity states from Home Assistant.
+    """
+    ha: Optional[HomeAssistantClient] = getattr(app.state, "ha_client", None)
+    if ha is None:
+        return {
+            "status": "disabled",
+            "reason": (
+                "Home Assistant not configured "
+                "(missing HOMEASSISTANT_BASE_URL or HOMEASSISTANT_TOKEN)"
+            ),
+        }
+
+    try:
+        states = ha.list_states()
+        return {"status": "ok", "states": states}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "error": str(exc)}
+
+
+@app.get("/homeassistant/state/{entity_id}")
+async def ha_get_state(entity_id: str) -> Dict[str, Any]:
+    """
+    Return the state for a single Home Assistant entity.
+    """
+    ha: Optional[HomeAssistantClient] = getattr(app.state, "ha_client", None)
+    if ha is None:
+        return {
+            "status": "disabled",
+            "reason": (
+                "Home Assistant not configured "
+                "(missing HOMEASSISTANT_BASE_URL or HOMEASSISTANT_TOKEN)"
+            ),
+            "entity_id": entity_id,
+        }
+
+    try:
+        state = ha.get_state(entity_id)
+        return {"status": "ok", "state": state}
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "error",
+            "entity_id": entity_id,
+            "error": str(exc),
+        }
+
+
+@app.post("/homeassistant/service/{domain}/{service}")
+async def ha_call_service(
+    domain: str,
+    service: str,
+    data: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """
+    Call a Home Assistant service, e.g. light.turn_on.
+    """
+    ha: Optional[HomeAssistantClient] = getattr(app.state, "ha_client", None)
+    if ha is None:
+        return {
+            "status": "disabled",
+            "reason": (
+                "Home Assistant not configured "
+                "(missing HOMEASSISTANT_BASE_URL or HOMEASSISTANT_TOKEN)"
+            ),
+            "domain": domain,
+            "service": service,
+        }
+
+    try:
+        result = ha.call_service(domain, service, data or {})
+        return {"status": "ok", "result": result}
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "error",
+            "domain": domain,
+            "service": service,
+            "error": str(exc),
+        }
+
+
+# ---------------------------------------------------------
 # Core ask/history endpoints
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------
 
 @app.post("/ask")
 def ask_jarvis(body: AskRequest) -> Dict[str, Any]:

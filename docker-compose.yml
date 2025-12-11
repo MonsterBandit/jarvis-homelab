@@ -23,7 +23,9 @@ services:
     networks:
       - jarvis_net
     expose:
-      - "8000"
+      - "8000"       # internal Docker Network
+    ports:
+      - "8000:8000"  # host:container mapping
     volumes:
       - /opt/jarvis/brain-data:/app/data
     environment:
