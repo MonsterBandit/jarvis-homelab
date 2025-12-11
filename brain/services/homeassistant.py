@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -10,7 +10,7 @@ import requests
 class HomeAssistantConfig:
     base_url: str
     token: str
-    timeout: float = 5.0
+    timeout: float = 8.0  # Phase 5.6: slightly more generous default
 
     @property
     def api_base(self) -> str:
@@ -21,8 +21,9 @@ class HomeAssistantClient:
     """
     Minimal synchronous client for Home Assistant's HTTP API.
 
-    Right now we only need a simple health check. We can extend this later
+    We started with a simple health check and have been extending this
     with methods for entities, states, and service calls.
+    Phase 5.6 adds better error handling and timeouts.
     """
 
     def __init__(self, config: HomeAssistantConfig) -> None:
@@ -40,14 +41,58 @@ class HomeAssistantClient:
             path = "/" + path
         return self.config.api_base + path
 
+    def _request(
+        self,
+        method: str,
+        path: str,
+        json: Optional[Dict[str, Any]] = None,
+    ) -> requests.Response:
+        """
+        Internal helper to send an HTTP request to Home Assistant
+        with consistent timeout and error handling.
+        """
+        url = self._build_url(path)
+
+        try:
+            resp = self._session.request(
+                method=method.upper(),
+                url=url,
+                json=json,
+                timeout=self.config.timeout,
+            )
+        except requests.Timeout as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"Home Assistant request to {url} timed out after "
+                f"{self.config.timeout} seconds"
+            ) from exc
+        except requests.RequestException as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"Error communicating with Home Assistant at {url}: {exc}"
+            ) from exc
+
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as exc:  # noqa: BLE001
+            # Include a small slice of the response body for diagnostics
+            body_snippet = resp.text[:500]
+            raise RuntimeError(
+                f"Home Assistant returned HTTP {resp.status_code} for {url}: "
+                f"{body_snippet}"
+            ) from exc
+
+        return resp
+
     def health(self) -> Tuple[bool, Dict[str, Any]]:
         """
         Call HA /api/ endpoint to verify connectivity.
 
         Returns:
             (ok, details)
-            ok: True if HA responds with 200 and a JSON body containing "message".
-            details: dict with status_code, body, and/or error info.
+
+            ok:
+                True if HA responds with 200 and a JSON body containing "message".
+            details:
+                dict with status_code, body, and/or error info.
         """
         url = self._build_url("/")
         try:
@@ -71,17 +116,15 @@ class HomeAssistantClient:
             "url": url,
         }
 
-    # =========================
-    # New Phase 5.3 methods
-    # =========================
+    # ==========================
+    # States
+    # ==========================
 
     def list_states(self) -> List[Dict[str, Any]]:
         """
         Return all entity states from Home Assistant (`GET /api/states`).
         """
-        url = self._build_url("/states")
-        resp = self._session.get(url, timeout=self.config.timeout)
-        resp.raise_for_status()
+        resp = self._request("GET", "/states")
         return resp.json()
 
     def get_state(self, entity_id: str) -> Dict[str, Any]:
@@ -89,9 +132,18 @@ class HomeAssistantClient:
         Return the state for a single entity (`GET /api/states/{entity_id}`).
         """
         path = f"/states/{entity_id}"
-        url = self._build_url(path)
-        resp = self._session.get(url, timeout=self.config.timeout)
-        resp.raise_for_status()
+        resp = self._request("GET", path)
+        return resp.json()
+
+    # ==========================
+    # Services
+    # ==========================
+
+    def list_services(self) -> List[Dict[str, Any]]:
+        """
+        Return all available Home Assistant services (`GET /api/services`).
+        """
+        resp = self._request("GET", "/services")
         return resp.json()
 
     def call_service(
@@ -112,15 +164,9 @@ class HomeAssistantClient:
             dict with status_code, body, and url.
         """
         path = f"/services/{domain}/{service}"
-        url = self._build_url(path)
         payload: Dict[str, Any] = data or {}
 
-        resp = self._session.post(
-            url,
-            json=payload,
-            timeout=self.config.timeout,
-        )
-        resp.raise_for_status()
+        resp = self._request("POST", path, json=payload)
 
         try:
             body: Any = resp.json()
@@ -130,7 +176,7 @@ class HomeAssistantClient:
         return {
             "status_code": resp.status_code,
             "body": body,
-            "url": url,
+            "url": self._build_url(path),
         }
 
     def close(self) -> None:
