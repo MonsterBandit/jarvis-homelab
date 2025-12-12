@@ -4,7 +4,7 @@ import os
 import socket
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -834,6 +834,294 @@ async def grocy_summary(
 
 
 # ---------------------------------------------------------
+# Meal planner router & endpoints (Phase 6.5)
+# ---------------------------------------------------------
+
+class MealPlanPreferences(BaseModel):
+    max_meals: int = 7
+    vegetarian_nights: int = 0
+    avoid_duplicates: bool = True
+
+
+class ShoppingListItem(BaseModel):
+    name: str
+    quantity: Optional[str] = None
+    home: Optional[str] = None
+
+
+class PlannedMeal(BaseModel):
+    date: Optional[datetime] = None
+    recipe_id: str
+    recipe_name: str
+    ready: bool
+    missing_items: List[ShoppingListItem]
+
+
+class MealPlanRequest(BaseModel):
+    household: str
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
+    preferences: MealPlanPreferences = MealPlanPreferences()
+
+
+class MealPlanResponse(BaseModel):
+    household: str
+    plan: List[PlannedMeal]
+    shopping_list: List[ShoppingListItem]
+
+
+# A small placeholder recipe library. In future phases this can move into
+# the database or a dedicated recipes service.
+RECIPE_LIBRARY: List[Dict[str, Any]] = [
+    {
+        "id": "pasta_bake",
+        "name": "Pasta Bake",
+        "tags": ["dinner"],
+        "ingredients": [
+            {"name": "Pasta", "quantity": "250g"},
+            {"name": "Tomato Sauce", "quantity": "1 jar"},
+            {"name": "Mozzarella", "quantity": "150g"},
+        ],
+    },
+    {
+        "id": "veggie_chili",
+        "name": "Vegetarian Chili",
+        "tags": ["dinner", "vegetarian"],
+        "ingredients": [
+            {"name": "Kidney Beans", "quantity": "1 can"},
+            {"name": "Black Beans", "quantity": "1 can"},
+            {"name": "Tomatoes", "quantity": "1 can"},
+        ],
+    },
+    {
+        "id": "chicken_rice_bowl",
+        "name": "Chicken Rice Bowl",
+        "tags": ["dinner"],
+        "ingredients": [
+            {"name": "Chicken Breast", "quantity": "300g"},
+            {"name": "Rice", "quantity": "200g"},
+            {"name": "Broccoli", "quantity": "150g"},
+        ],
+    },
+]
+
+
+def _normalize_name(name: str) -> str:
+    return "".join(ch.lower() for ch in name if ch.isalnum() or ch.isspace()).strip()
+
+
+def _build_inventory_index(stock_payload: Dict[str, Any], household: str) -> Dict[str, float]:
+    """
+    Build a simple index of available stock keyed by normalized product name.
+
+    We attempt to be defensive about the exact Grocy schema by looking for
+    any list-valued fields in the stock payload and treating them as stock
+    rows that may contain "product" and "amount" fields.
+    """
+    # Collect all list-like stock entries
+    raw_items: List[Dict[str, Any]] = []
+    for value in stock_payload.values():
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    raw_items.append(item)
+
+    # Apply household/location filtering if configured
+    filtered_items = filter_stock_by_household(raw_items, household)
+
+    index: Dict[str, float] = {}
+    for item in filtered_items:
+        product_name = item.get("product") or item.get("name")
+        if not product_name:
+            continue
+        norm = _normalize_name(str(product_name))
+        try:
+            amount = float(item.get("amount", 0))
+        except (TypeError, ValueError):
+            amount = 0.0
+        index[norm] = index.get(norm, 0.0) + amount
+
+    return index
+
+
+def _evaluate_recipe_against_inventory(
+    recipe: Dict[str, Any],
+    inventory_index: Dict[str, float],
+    household: str,
+) -> Dict[str, Any]:
+    """
+    Compare a single recipe against a household's inventory index and return
+    whether it is cookable plus any missing ingredients.
+    """
+    missing: List[ShoppingListItem] = []
+    for ingredient in recipe.get("ingredients", []):
+        ing_name = str(ingredient.get("name", "")).strip()
+        if not ing_name:
+            continue
+        norm = _normalize_name(ing_name)
+        available_amount = inventory_index.get(norm, 0.0)
+        # For now we only check presence (amount > 0), not exact quantity.
+        if available_amount <= 0:
+            missing.append(
+                ShoppingListItem(
+                    name=ing_name,
+                    quantity=str(ingredient.get("quantity") or ""),
+                    home=household,
+                )
+            )
+
+    ready = len(missing) == 0
+
+    return {
+        "ready": ready,
+        "missing_items": missing,
+    }
+
+
+mealplanner_router = APIRouter(
+    prefix="/mealplanner",
+    tags=["mealplanner"],
+    dependencies=[Depends(require_api_key)],
+)
+
+
+@mealplanner_router.post("/plan", response_model=MealPlanResponse)
+async def generate_meal_plan(
+    body: MealPlanRequest,
+    client: Optional[GrocyClient] = Depends(get_grocy_client),
+) -> MealPlanResponse:
+    """
+    Generate a simple per-household meal plan based on Grocy stock and a
+    small built-in recipe library.
+
+    This is an early Phase 6.5 scaffold that will be expanded in later
+    phases with richer recipe data, nutrition, and calendar integration.
+    """
+    if client is None:
+        # Reuse the Grocy-style disabled response semantics but surface as HTTP error
+        raise HTTPException(
+            status_code=503,
+            detail="Grocy client not configured; meal planning is unavailable.",
+        )
+
+    household = body.household.strip().lower()
+    if household not in {"home_a", "home_b"}:
+        raise HTTPException(
+            status_code=400,
+            detail="household must be 'home_a' or 'home_b'",
+        )
+
+    # Fetch stock once for the selected household
+    try:
+        stock_payload = await client.get_stock_overview(household=household)
+    except GrocyError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error fetching stock from Grocy: {exc}",
+        ) from exc
+
+    inventory_index = _build_inventory_index(stock_payload, household)
+    preferences = body.preferences or MealPlanPreferences()
+
+    # Evaluate recipes
+    evaluated_recipes: List[Dict[str, Any]] = []
+    vegetarian_needed = max(preferences.vegetarian_nights, 0)
+    veg_recipes: List[Dict[str, Any]] = []
+    nonveg_recipes: List[Dict[str, Any]] = []
+
+    for recipe in RECIPE_LIBRARY:
+        eval_result = _evaluate_recipe_against_inventory(
+            recipe, inventory_index, household
+        )
+        recipe_entry = {
+            "recipe": recipe,
+            "ready": eval_result["ready"],
+            "missing_items": eval_result["missing_items"],
+        }
+        tags = {t.lower() for t in recipe.get("tags", [])}
+        if "vegetarian" in tags:
+            veg_recipes.append(recipe_entry)
+        else:
+            nonveg_recipes.append(recipe_entry)
+        evaluated_recipes.append(recipe_entry)
+
+    # Helper to sort recipes: prefer ready, then fewest missing items
+    def _sort_key(entry: Dict[str, Any]) -> Any:
+        return (
+            0 if entry["ready"] else 1,
+            len(entry["missing_items"]),
+        )
+
+    veg_recipes.sort(key=_sort_key)
+    nonveg_recipes.sort(key=_sort_key)
+
+    max_meals = max(preferences.max_meals, 1)
+    chosen: List[Dict[str, Any]] = []
+
+    # First, pick vegetarian meals if requested
+    for entry in veg_recipes:
+        if len(chosen) >= max_meals or len(chosen) >= vegetarian_needed:
+            break
+        chosen.append(entry)
+
+    # Then fill the remaining slots with any recipes
+    pool = veg_recipes + nonveg_recipes
+    if preferences.avoid_duplicates:
+        # Remove recipes already chosen
+        chosen_ids = {e["recipe"]["id"] for e in chosen}
+        pool = [e for e in pool if e["recipe"]["id"] not in chosen_ids]
+
+    for entry in pool:
+        if len(chosen) >= max_meals:
+            break
+        chosen.append(entry)
+
+    # Build date assignments if a range is provided
+    planned_meals: List[PlannedMeal] = []
+    if body.start_date and body.end_date:
+        if body.end_date < body.start_date:
+            raise HTTPException(
+                status_code=400,
+                detail="end_date must be on or after start_date",
+            )
+        total_days = (body.end_date - body.start_date).days + 1
+        if total_days <= 0:
+            total_days = 1
+    else:
+        total_days = 0
+
+    shopping_list: List[ShoppingListItem] = []
+
+    for idx, entry in enumerate(chosen):
+        recipe = entry["recipe"]
+        missing_items: List[ShoppingListItem] = entry["missing_items"]
+        if body.start_date and body.end_date and total_days > 0:
+            # Distribute meals across the date range in order
+            day_index = idx % total_days
+            meal_date = body.start_date + timedelta(days=day_index)
+        else:
+            meal_date = None
+
+        planned_meals.append(
+            PlannedMeal(
+                date=meal_date,
+                recipe_id=str(recipe["id"]),
+                recipe_name=str(recipe["name"]),
+                ready=entry["ready"],
+                missing_items=missing_items,
+            )
+        )
+
+        shopping_list.extend(missing_items)
+
+    return MealPlanResponse(
+        household=household,
+        plan=planned_meals,
+        shopping_list=shopping_list,
+    )
+
+
+# ---------------------------------------------------------
 # BarcodeBuddy router & endpoints
 # ---------------------------------------------------------
 
@@ -1006,4 +1294,5 @@ async def model_client_error_handler(
 app.include_router(health_router)
 app.include_router(ha_router)
 app.include_router(grocy_router)
+app.include_router(mealplanner_router)
 app.include_router(barcode_router)
