@@ -29,12 +29,26 @@ services:
     volumes:
       - /opt/jarvis/brain-data:/app/data
     environment:
-      # OpenAI-compatible config
+      # OpenAI-compatible / model-agnostic config
       JARVIS_LLM_API_KEY: ${JARVIS_LLM_API_KEY}
       JARVIS_LLM_BASE_URL: ${JARVIS_LLM_BASE_URL:-https://api.openai.com/v1}
       JARVIS_LLM_MODEL: ${JARVIS_LLM_MODEL:-gpt-4o-mini}
+      JARVIS_LLM_PROVIDER: ${JARVIS_LLM_PROVIDER:-openai}
+
+      # Home Assistant
       HOMEASSISTANT_BASE_URL: ${HOMEASSISTANT_BASE_URL}
       HOMEASSISTANT_TOKEN: ${HOMEASSISTANT_TOKEN}
+
+      # Grocy
+      GROCY_BASE_URL: ${GROCY_BASE_URL}
+      GROCY_API_KEY: ${GROCY_API_KEY}
+
+      # Jarvis API key for frontend/backend auth
+      JARVIS_API_KEY: ${JARVIS_API_KEY}
+
+      # BarcodeBuddy
+      BARCODEBUDDY_BASE_URL: ${BARCODEBUDDY_BASE_URL}
+      BARCODEBUDDY_API_KEY: ${BARCODEBUDDY_API_KEY}
 
 networks:
   jarvis_net:

@@ -9,17 +9,29 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import psutil
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import (
+    APIRouter,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from model_client import (
-    OpenAICompatibleClient,
     GeminiModelClient,
     ModelClientError,
+    OpenAICompatibleClient,
 )
 from services.homeassistant import HomeAssistantClient, HomeAssistantConfig
-
+from services.grocy import GrocyClient, GrocyError, create_grocy_client
+from services.barcodebuddy import (
+    BarcodeBuddyClient,
+    BarcodeBuddyError,
+    create_barcodebuddy_client,
+)
 
 # ---------------------------------------------------------
 # FastAPI app
@@ -28,13 +40,13 @@ from services.homeassistant import HomeAssistantClient, HomeAssistantConfig
 app = FastAPI(
     title="Jarvis Brain",
     description="Backend API for your personal Jarvis assistant",
-    version="0.2.0",
+    version="0.5.0",
 )
 
 # Allow the web UI (jarvis-agent / NGINX front) to call us
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can lock this down to specific domains later
+    allow_origins=["*"],  # can be restricted later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -42,7 +54,6 @@ app.add_middleware(
 
 # Record when the service started (for uptime)
 START_TIME = time.time()
-
 
 # ---------------------------------------------------------
 # Database setup (for conversation history)
@@ -102,8 +113,7 @@ def fetch_recent_conversations(limit: int = 20) -> List[Dict[str, Any]]:
     finally:
         conn.close()
 
-    # newest last for nicer display
-    rows.reverse()
+    rows.reverse()  # newest last for nicer display
     return [
         {
             "id": row[0],
@@ -135,15 +145,12 @@ if LLM_PROVIDER == "openai":
         model=LLM_MODEL,
     )
 elif LLM_PROVIDER == "gemini":
-    # NOTE: This will raise a clear ModelClientError if someone
-    # actually tries to use it before we implement the HTTP calls.
     model_client = GeminiModelClient(
         api_key=LLM_API_KEY,
         model=LLM_MODEL,
     )
 else:
     raise RuntimeError(f"Unsupported JARVIS_LLM_PROVIDER: {LLM_PROVIDER}")
-
 
 # ---------------------------------------------------------
 # API key security (optional)
@@ -160,11 +167,9 @@ def require_api_key(x_jarvis_api_key: str = Header(default="")) -> None:
     this as a dependency will require the client to send:
         X-Jarvis-Api-Key: <JARVIS_API_KEY>
 
-    If JARVIS_API_KEY is not set, this check is effectively disabled and
-    all requests are allowed.
+    If JARVIS_API_KEY is not set, this check is effectively disabled.
     """
     if not API_KEY:
-        # Security disabled; accept all requests
         return
 
     if x_jarvis_api_key != API_KEY:
@@ -177,7 +182,7 @@ def require_api_key(x_jarvis_api_key: str = Header(default="")) -> None:
 
 HA_BASE_URL = os.getenv("HOMEASSISTANT_BASE_URL")
 HA_TOKEN = os.getenv("HOMEASSISTANT_TOKEN")
-HA_TIMEOUT = float(os.getenv("HOMEASSISTANT_TIMEOUT", "8.0"))  # Phase 5.6
+HA_TIMEOUT = float(os.getenv("HOMEASSISTANT_TIMEOUT", "8.0"))
 
 
 def create_ha_client() -> Optional[HomeAssistantClient]:
@@ -199,18 +204,77 @@ def create_ha_client() -> Optional[HomeAssistantClient]:
 
 app.state.ha_client = create_ha_client()
 
+# ---------------------------------------------------------
+# Grocy / household helpers (Phase 6.5 scaffolding)
+# ---------------------------------------------------------
+
+
+def _parse_location_ids(env_name: str) -> List[int]:
+    raw = os.getenv(env_name, "") or ""
+    ids: List[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.append(int(part))
+        except ValueError:
+            # Ignore invalid entries instead of crashing
+            continue
+    return ids
+
+
+GROCY_HOME_A_LOCATION_IDS = _parse_location_ids("GROCY_HOME_A_LOCATION_IDS")
+GROCY_HOME_B_LOCATION_IDS = _parse_location_ids("GROCY_HOME_B_LOCATION_IDS")
+
+
+def filter_stock_by_household(
+    stock_items: List[Dict[str, Any]],
+    household: Optional[str],
+) -> List[Dict[str, Any]]:
+    """
+    Filter stock items by household using Grocy location IDs.
+
+    - household="home_a" -> GROCY_HOME_A_LOCATION_IDS
+    - household="home_b" -> GROCY_HOME_B_LOCATION_IDS
+    - household=None or "all" -> no filtering
+
+    If env vars are not set, returns stock unfiltered.
+    """
+    if household in (None, "", "all"):
+        return stock_items
+
+    if household == "home_a" and GROCY_HOME_A_LOCATION_IDS:
+        allowed = set(GROCY_HOME_A_LOCATION_IDS)
+    elif household == "home_b" and GROCY_HOME_B_LOCATION_IDS:
+        allowed = set(GROCY_HOME_B_LOCATION_IDS)
+    else:
+        # Unknown household or no config; fall back to unfiltered
+        return stock_items
+
+    return [
+        item for item in stock_items
+        if item.get("location_id") in allowed
+    ]
+
 
 # ---------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------
 
+
 class AskRequest(BaseModel):
     message: str
+
+
+class BarcodeScanRequest(BaseModel):
+    barcode: str
 
 
 # ---------------------------------------------------------
 # Basic health & identity endpoints
 # ---------------------------------------------------------
+
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
@@ -225,7 +289,7 @@ def whoami() -> Dict[str, Any]:
         "name": "Jarvis",
         "role": "Personal homelab assistant",
         "host": socket.gethostname(),
-        "version": "0.2.0",
+        "version": "0.5.0",
         "description": (
             "I run in your homelab and help you monitor, automate, and query your systems."
         ),
@@ -286,12 +350,11 @@ def uptime() -> Dict[str, Any]:
 # Home Assistant endpoints
 # ---------------------------------------------------------
 
+
 @app.get("/homeassistant/health", dependencies=[Depends(require_api_key)])
 async def homeassistant_health() -> Dict[str, Any]:
     """
     Health check for Home Assistant connectivity.
-
-    Uses the HomeAssistantClient to call HA's /api/ endpoint.
     """
     client = getattr(app.state, "ha_client", None)
     if client is None:
@@ -309,10 +372,6 @@ async def homeassistant_health() -> Dict[str, Any]:
         "details": details,
     }
 
-
-# ---------------------------------------------------------
-# Home Assistant States & Services
-# ---------------------------------------------------------
 
 @app.get("/homeassistant/states", dependencies=[Depends(require_api_key)])
 async def ha_list_states() -> Dict[str, Any]:
@@ -427,13 +486,7 @@ async def ha_call_service(
 @app.get("/homeassistant/summary", dependencies=[Depends(require_api_key)])
 async def ha_summary() -> Dict[str, Any]:
     """
-    Return a high-level summary of Home Assistant state that is easy for
-    both humans and LLMs to consume.
-
-    Includes:
-      - total entities and counts by domain
-      - snapshots of key domains (lights, switches, climate, media_player)
-      - a list of entities in 'unavailable' or 'unknown' states
+    Return a high-level summary of Home Assistant state.
     """
     ha: Optional[HomeAssistantClient] = getattr(app.state, "ha_client", None)
     if ha is None:
@@ -529,8 +582,264 @@ async def ha_summary() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------
+# Grocy router & endpoints
+# ---------------------------------------------------------
+
+grocy_router = APIRouter(
+    prefix="/grocy",
+    tags=["grocy"],
+    dependencies=[Depends(require_api_key)],
+)
+
+
+def _grocy_disabled_response(reason: Optional[str] = None) -> Dict[str, Any]:
+    base_reason = (
+        "Grocy not configured (missing GROCY_BASE_URL or GROCY_API_KEY, "
+        "or client not initialized)"
+    )
+    return {
+        "status": "disabled",
+        "reason": reason or base_reason,
+    }
+
+
+async def get_grocy_client() -> Optional[GrocyClient]:
+    """
+    Dependency that returns a configured GrocyClient, or None if
+    configuration is missing / invalid.
+    """
+    try:
+        client = await create_grocy_client()
+    except GrocyError:
+        return None
+    return client
+
+
+@grocy_router.get("/health")
+async def grocy_health(
+    client: Optional[GrocyClient] = Depends(get_grocy_client),
+) -> Dict[str, Any]:
+    """
+    Health check for Grocy connectivity.
+    """
+    if client is None:
+        return _grocy_disabled_response()
+
+    try:
+        info = await client.health()
+        return {"status": "ok", "info": info.get("info")}
+    except GrocyError as exc:
+        return {"status": "error", "error": str(exc)}
+
+
+@grocy_router.get("/stock")
+async def grocy_stock(
+    household: Optional[str] = Query(
+        default="all",
+        description="Filter by household: 'home_a', 'home_b', or 'all'.",
+    ),
+    client: Optional[GrocyClient] = Depends(get_grocy_client),
+) -> Dict[str, Any]:
+    """
+    Returns a stock overview (via /api/stock/volatile) and
+    supports optional household filtering.
+    """
+    if client is None:
+        return _grocy_disabled_response()
+
+    try:
+        raw = await client.get_stock_overview()
+    except GrocyError as exc:
+        return {"status": "error", "error": str(exc)}
+
+    filtered_payload: Dict[str, Any] = {}
+    for key, value in raw.items():
+        if isinstance(value, list):
+            filtered_payload[key] = filter_stock_by_household(value, household)
+        else:
+            filtered_payload[key] = value
+
+    return {
+        "status": "ok",
+        "household": household or "all",
+        "stock": filtered_payload,
+    }
+
+
+@grocy_router.get("/shopping-list")
+async def grocy_shopping_list(
+    client: Optional[GrocyClient] = Depends(get_grocy_client),
+) -> Dict[str, Any]:
+    """
+    Raw consolidated shopping list from Grocy.
+    """
+    if client is None:
+        return _grocy_disabled_response()
+
+    try:
+        data = await client.get_shopping_list()
+        return {"status": "ok", "shopping_list": data}
+    except GrocyError as exc:
+        return {"status": "error", "error": str(exc)}
+
+
+@grocy_router.get("/products")
+async def grocy_products(
+    client: Optional[GrocyClient] = Depends(get_grocy_client),
+) -> Dict[str, Any]:
+    """
+    Raw products table from Grocy.
+    """
+    if client is None:
+        return _grocy_disabled_response()
+
+    try:
+        products = await client.get_products()
+        return {"status": "ok", "products": products}
+    except GrocyError as exc:
+        return {"status": "error", "error": str(exc)}
+
+
+@grocy_router.get("/locations")
+async def grocy_locations(
+    client: Optional[GrocyClient] = Depends(get_grocy_client),
+) -> Dict[str, Any]:
+    """
+    Locations table, useful for mapping to households.
+    """
+    if client is None:
+        return _grocy_disabled_response()
+
+    try:
+        locations = await client.get_locations()
+        return {"status": "ok", "locations": locations}
+    except GrocyError as exc:
+        return {"status": "error", "error": str(exc)}
+
+
+@grocy_router.get("/summary")
+async def grocy_summary(
+    household: Optional[str] = Query(
+        default="all",
+        description="Filter by household: 'home_a', 'home_b', or 'all'.",
+    ),
+    client: Optional[GrocyClient] = Depends(get_grocy_client),
+) -> Dict[str, Any]:
+    """
+    High-level summary combining stock + shopping list.
+    """
+    if client is None:
+        return _grocy_disabled_response()
+
+    try:
+        stock = await client.get_stock_overview()
+        shopping_list = await client.get_shopping_list()
+    except GrocyError as exc:
+        return {"status": "error", "error": str(exc)}
+
+    filtered_stock: Dict[str, Any] = {}
+    for key, value in stock.items():
+        if isinstance(value, list):
+            filtered_stock[key] = filter_stock_by_household(value, household)
+        else:
+            filtered_stock[key] = value
+
+    return {
+        "status": "ok",
+        "household": household or "all",
+        "stock": filtered_stock,
+        "shopping_list": shopping_list,
+    }
+
+
+# ---------------------------------------------------------
+# BarcodeBuddy router & endpoints
+# ---------------------------------------------------------
+
+barcodebuddy_router = APIRouter(
+    prefix="/barcodebuddy",
+    tags=["barcodebuddy"],
+    dependencies=[Depends(require_api_key)],
+)
+
+
+def _barcodebuddy_disabled_response(reason: Optional[str] = None) -> Dict[str, Any]:
+    base_reason = "BarcodeBuddy not configured (missing BARCODEBUDDY_BASE_URL)"
+    return {
+        "status": "disabled",
+        "reason": reason or base_reason,
+    }
+
+
+async def get_barcodebuddy_client() -> Optional[BarcodeBuddyClient]:
+    """
+    Dependency that returns a configured BarcodeBuddyClient, or None if
+    configuration is missing / invalid.
+    """
+    try:
+        client = await create_barcodebuddy_client()
+    except BarcodeBuddyError:
+        return None
+    return client
+
+
+@barcodebuddy_router.get("/health")
+async def barcodebuddy_health(
+    client: Optional[BarcodeBuddyClient] = Depends(get_barcodebuddy_client),
+) -> Dict[str, Any]:
+    """
+    Check connectivity to Barcode Buddy.
+
+    Returns system info from /api/system/info.
+    """
+    if client is None:
+        # Graceful "off" state, just like Grocy/HA.
+        return _barcodebuddy_disabled_response()
+
+    try:
+        info = await client.health()
+        return {"status": "ok", "info": info}
+    except BarcodeBuddyError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Unexpected BarcodeBuddy error: {e}")
+
+
+@barcodebuddy_router.post("/scan")
+async def barcodebuddy_scan(
+    payload: BarcodeScanRequest,
+    client: Optional[BarcodeBuddyClient] = Depends(get_barcodebuddy_client),
+) -> Dict[str, Any]:
+    """
+    Pass a single barcode to Barcode Buddy.
+
+    BB will handle resolving the product, creating it in Grocy if needed,
+    and performing its configured action.
+    """
+    if client is None:
+        return _barcodebuddy_disabled_response()
+
+    try:
+        result = await client.scan_barcode(payload.barcode)
+        return {
+            "status": "ok",
+            "barcode": payload.barcode,
+            "result": result,
+        }
+    except BarcodeBuddyError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Unexpected BarcodeBuddy error: {e}")
+
+
+# Mount routers
+app.include_router(grocy_router)
+app.include_router(barcodebuddy_router)
+
+# ---------------------------------------------------------
 # Core ask/history endpoints
 # ---------------------------------------------------------
+
 
 @app.post("/ask", dependencies=[Depends(require_api_key)])
 def ask_jarvis(body: AskRequest) -> Dict[str, Any]:
