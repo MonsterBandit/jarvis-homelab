@@ -62,13 +62,15 @@ HOMEASSISTANT_TOKEN = os.getenv("HOMEASSISTANT_TOKEN", "")
 
 def init_db() -> None:
     """
-    Initialize the SQLite database with a simple conversation log table.
+    Initialize the SQLite database with required tables.
     """
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.cursor()
+
+        # Conversation log
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS conversation_log (
@@ -80,6 +82,28 @@ def init_db() -> None:
             )
             """
         )
+
+        # Shopping lists for Phase 6.5
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shopping_list (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                household TEXT NOT NULL,
+                item_name TEXT NOT NULL,
+                quantity TEXT,
+                source TEXT,
+                completed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_shopping_list_household_completed
+            ON shopping_list (household, completed)
+            """
+        )
+
         conn.commit()
     finally:
         conn.close()
@@ -140,6 +164,139 @@ def fetch_recent_conversations(limit: int = 20) -> List[Dict[str, Any]]:
             }
         )
     return items
+
+
+# Shopping list DB helpers
+def add_shopping_list_item(
+    household: str,
+    item_name: str,
+    quantity: Optional[str] = None,
+    source: Optional[str] = None,
+) -> int:
+    """
+    Insert a shopping list item and return its new ID.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO shopping_list (household, item_name, quantity, source, completed, created_at)
+            VALUES (?, ?, ?, ?, 0, ?)
+            """,
+            (
+                household,
+                item_name,
+                quantity,
+                source,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def get_shopping_list_items(
+    household: str,
+    include_completed: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch shopping list items for a given household.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        if include_completed:
+            cur.execute(
+                """
+                SELECT id, household, item_name, quantity, source, completed, created_at
+                FROM shopping_list
+                WHERE household = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (household,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT id, household, item_name, quantity, source, completed, created_at
+                FROM shopping_list
+                WHERE household = ? AND completed = 0
+                ORDER BY created_at ASC, id ASC
+                """,
+                (household,),
+            )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        (
+            item_id,
+            hh,
+            name,
+            quantity,
+            source,
+            completed,
+            created_at,
+        ) = row
+        items.append(
+            {
+                "id": item_id,
+                "household": hh,
+                "name": name,
+                "quantity": quantity,
+                "source": source,
+                "completed": bool(completed),
+                "created_at": created_at,
+            }
+        )
+    return items
+
+
+def delete_shopping_list_item(household: str, item_id: int) -> bool:
+    """
+    Delete a single shopping list item for a given household.
+    Returns True if something was deleted.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            DELETE FROM shopping_list
+            WHERE household = ? AND id = ?
+            """,
+            (household, item_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def clear_shopping_list(household: str) -> int:
+    """
+    Delete all shopping list items for a given household.
+    Returns number of rows deleted.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            DELETE FROM shopping_list
+            WHERE household = ?
+            """,
+            (household,),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
 
 
 # ----------------------------
@@ -833,6 +990,113 @@ async def grocy_summary(
     }
 
 
+# ----------------------------
+# Jarvis-managed shopping lists
+# ----------------------------
+
+VALID_LIST_HOUSEHOLDS = {"home_a", "home_b", "shared"}
+
+
+def _normalize_list_household(household: str) -> str:
+    h = (household or "").strip().lower()
+    if h not in VALID_LIST_HOUSEHOLDS:
+        raise HTTPException(
+            status_code=400,
+            detail="household must be 'home_a', 'home_b', or 'shared'",
+        )
+    return h
+
+
+class ShoppingListCreateRequest(BaseModel):
+    name: str
+    quantity: Optional[str] = None
+    source: Optional[str] = "manual"
+
+
+@grocy_router.get("/list/{household}")
+async def jarvis_shopping_list_get(
+    household: str,
+    include_completed: bool = Query(
+        default=False,
+        description="If true, include completed items as well.",
+    ),
+) -> Dict[str, Any]:
+    """
+    Return the Jarvis-managed shopping list for a given household
+    ('home_a', 'home_b', or 'shared').
+    """
+    hh = _normalize_list_household(household)
+    items = get_shopping_list_items(hh, include_completed=include_completed)
+    return {
+        "status": "ok",
+        "household": hh,
+        "items": items,
+    }
+
+
+@grocy_router.post("/list/{household}")
+async def jarvis_shopping_list_add(
+    household: str,
+    body: ShoppingListCreateRequest,
+) -> Dict[str, Any]:
+    """
+    Append a new item to the Jarvis-managed shopping list
+    for the given household.
+    """
+    hh = _normalize_list_household(household)
+    item_id = add_shopping_list_item(
+        household=hh,
+        item_name=body.name.strip(),
+        quantity=body.quantity.strip() if body.quantity else None,
+        source=body.source,
+    )
+    items = get_shopping_list_items(hh, include_completed=False)
+    return {
+        "status": "ok",
+        "household": hh,
+        "created_id": item_id,
+        "items": items,
+    }
+
+
+@grocy_router.delete("/list/{household}/{item_id}")
+async def jarvis_shopping_list_delete_item(
+    household: str,
+    item_id: int,
+) -> Dict[str, Any]:
+    """
+    Delete a single shopping list item for the given household.
+    """
+    hh = _normalize_list_household(household)
+    deleted = delete_shopping_list_item(hh, item_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    items = get_shopping_list_items(hh, include_completed=False)
+    return {
+        "status": "ok",
+        "household": hh,
+        "items": items,
+    }
+
+
+@grocy_router.delete("/list/{household}")
+async def jarvis_shopping_list_clear(
+    household: str,
+) -> Dict[str, Any]:
+    """
+    Clear all shopping list items for the given household.
+    """
+    hh = _normalize_list_household(household)
+    deleted_count = clear_shopping_list(hh)
+    return {
+        "status": "ok",
+        "household": hh,
+        "deleted": deleted_count,
+        "items": [],
+    }
+
+
 # ---------------------------------------------------------
 # Meal planner router & endpoints (Phase 6.5)
 # ---------------------------------------------------------
@@ -998,7 +1262,6 @@ async def generate_meal_plan(
     phases with richer recipe data, nutrition, and calendar integration.
     """
     if client is None:
-        # Reuse the Grocy-style disabled response semantics but surface as HTTP error
         raise HTTPException(
             status_code=503,
             detail="Grocy client not configured; meal planning is unavailable.",
