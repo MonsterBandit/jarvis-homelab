@@ -5,50 +5,68 @@ services:
     restart: unless-stopped
 
     volumes:
-      # simple static site content (you can drop an index.html in here later)
+      # Gemini-style Jarvis UI served as a static site
       - /opt/jarvis/data:/usr/share/nginx/html:ro
 
     networks:
       - jarvis_net
 
-    # internal port only; NPM will forward to this
+    # Internal port only; NPM / reverse proxy will forward to this
     expose:
       - "80"
-##
-##
+
   jarvis-brain:
-    build: ./brain
+    build:
+      context: ./brain
+    image: jarvis-jarvis-brain
     container_name: jarvis-brain
     restart: unless-stopped
+
     networks:
       - jarvis_net
-    expose:
-      - "8000"       # internal Docker Network
+
+    # Expose FastAPI on 8000 to the host (and NPM)
     ports:
-      - "8000:8000"  # host:container mapping
+      - "8000:8000"
+
+    # Persist the SQLite DB and any brain data
     volumes:
       - /opt/jarvis/brain-data:/app/data
+
     environment:
-      # OpenAI-compatible / model-agnostic config
+      # LLM config (model-agnostic wrapper)
+      JARVIS_LLM_PROVIDER: ${JARVIS_LLM_PROVIDER}
       JARVIS_LLM_API_KEY: ${JARVIS_LLM_API_KEY}
-      JARVIS_LLM_BASE_URL: ${JARVIS_LLM_BASE_URL:-https://api.openai.com/v1}
-      JARVIS_LLM_MODEL: ${JARVIS_LLM_MODEL:-gpt-4o-mini}
-      JARVIS_LLM_PROVIDER: ${JARVIS_LLM_PROVIDER:-openai}
+      JARVIS_LLM_BASE_URL: ${JARVIS_LLM_BASE_URL}
+      JARVIS_LLM_MODEL: ${JARVIS_LLM_MODEL}
+
+      # Explicit vars required by the "openai-compatible" provider
+      OPENAI_COMPATIBLE_API_BASE: ${OPENAI_COMPATIBLE_API_BASE}
+      OPENAI_COMPATIBLE_API_KEY: ${OPENAI_COMPATIBLE_API_KEY}
 
       # Home Assistant
       HOMEASSISTANT_BASE_URL: ${HOMEASSISTANT_BASE_URL}
       HOMEASSISTANT_TOKEN: ${HOMEASSISTANT_TOKEN}
 
-      # Grocy
+      # Grocy Household A (legacy single-instance + home_a)
       GROCY_BASE_URL: ${GROCY_BASE_URL}
       GROCY_API_KEY: ${GROCY_API_KEY}
+      GROCY_HOME_A_LOCATION_IDS: ${GROCY_HOME_A_LOCATION_IDS}
 
-      # Jarvis API key for frontend/backend auth
-      JARVIS_API_KEY: ${JARVIS_API_KEY}
+      # Grocy Household B
+      GROCY_HOME_B_BASE_URL: ${GROCY_HOME_B_BASE_URL}
+      GROCY_HOME_B_API_KEY: ${GROCY_HOME_B_API_KEY}
+      GROCY_HOME_B_LOCATION_IDS: ${GROCY_HOME_B_LOCATION_IDS}
 
       # BarcodeBuddy
       BARCODEBUDDY_BASE_URL: ${BARCODEBUDDY_BASE_URL}
       BARCODEBUDDY_API_KEY: ${BARCODEBUDDY_API_KEY}
+
+      # Jarvis DB path inside the container
+      JARVIS_DB_PATH: /app/data/jarvis_brain.db
+
+      # (Optional) Jarvis API key for frontend/backend auth
+      JARVIS_API_KEY: ${JARVIS_API_KEY}
 
 networks:
   jarvis_net:
