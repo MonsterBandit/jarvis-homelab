@@ -1,73 +1,81 @@
+name: jarvis
+
 services:
   jarvis-agent:
-    image: nginx:alpine
     container_name: jarvis-agent
-    restart: unless-stopped
-
-    volumes:
-      # Gemini-style Jarvis UI served as a static site
-      - /opt/jarvis/data:/usr/share/nginx/html:ro
-
-    networks:
-      - jarvis_net
-
-    # Internal port only; NPM / reverse proxy will forward to this
+    image: nginx:alpine
     expose:
       - "80"
-
-  jarvis-brain:
-    build:
-      context: ./brain
-    image: jarvis-jarvis-brain
-    container_name: jarvis-brain
-    restart: unless-stopped
-
     networks:
       - jarvis_net
-
-    # Expose FastAPI on 8000 to the host (and NPM)
-    ports:
-      - "8000:8000"
-
-    # Persist the SQLite DB and any brain data
+    restart: unless-stopped
     volumes:
-      - /opt/jarvis/brain-data:/app/data
+      - type: bind
+        source: /opt/jarvis/data
+        target: /usr/share/nginx/html
+        read_only: true
+        bind:
+          create_host_path: true
+
+  jarvis-brain:
+    container_name: jarvis-brain
+    build:
+      context: /opt/jarvis/brain
+      dockerfile: Dockerfile
+
+    # 🔑 THIS IS THE CRITICAL FIX
+    # Load all real values directly from /opt/jarvis/.env
+    env_file:
+      - /opt/jarvis/.env
 
     environment:
-      # LLM config (model-agnostic wrapper)
-      JARVIS_LLM_PROVIDER: ${JARVIS_LLM_PROVIDER}
-      JARVIS_LLM_API_KEY: ${JARVIS_LLM_API_KEY}
-      JARVIS_LLM_BASE_URL: ${JARVIS_LLM_BASE_URL}
-      JARVIS_LLM_MODEL: ${JARVIS_LLM_MODEL}
+      # BarcodeBuddy
+      BARCODEBUDDY_API_KEY: ${BARCODEBUDDY_API_KEY}
+      BARCODEBUDDY_BASE_URL: ${BARCODEBUDDY_BASE_URL}
 
-      # Explicit vars required by the "openai-compatible" provider
-      OPENAI_COMPATIBLE_API_BASE: ${OPENAI_COMPATIBLE_API_BASE}
-      OPENAI_COMPATIBLE_API_KEY: ${OPENAI_COMPATIBLE_API_KEY}
+      # Grocy (dual household)
+      GROCY_HOME_A_LOCATION_IDS: ${GROCY_HOME_A_LOCATION_IDS}
+      GROCY_HOME_B_BASE_URL: ${GROCY_HOME_B_BASE_URL}
+      GROCY_HOME_B_API_KEY: ${GROCY_HOME_B_API_KEY}
+      GROCY_HOME_B_LOCATION_IDS: ${GROCY_HOME_B_LOCATION_IDS}
 
       # Home Assistant
       HOMEASSISTANT_BASE_URL: ${HOMEASSISTANT_BASE_URL}
       HOMEASSISTANT_TOKEN: ${HOMEASSISTANT_TOKEN}
 
-      # Grocy Household A (legacy single-instance + home_a)
-      GROCY_BASE_URL: ${GROCY_BASE_URL}
-      GROCY_API_KEY: ${GROCY_API_KEY}
-      GROCY_HOME_A_LOCATION_IDS: ${GROCY_HOME_A_LOCATION_IDS}
-
-      # Grocy Household B
-      GROCY_HOME_B_BASE_URL: ${GROCY_HOME_B_BASE_URL}
-      GROCY_HOME_B_API_KEY: ${GROCY_HOME_B_API_KEY}
-      GROCY_HOME_B_LOCATION_IDS: ${GROCY_HOME_B_LOCATION_IDS}
-
-      # BarcodeBuddy
-      BARCODEBUDDY_BASE_URL: ${BARCODEBUDDY_BASE_URL}
-      BARCODEBUDDY_API_KEY: ${BARCODEBUDDY_API_KEY}
-
-      # Jarvis DB path inside the container
-      JARVIS_DB_PATH: /app/data/jarvis_brain.db
-
-      # (Optional) Jarvis API key for frontend/backend auth
+      # Jarvis core
       JARVIS_API_KEY: ${JARVIS_API_KEY}
+      JARVIS_DB_PATH: ${JARVIS_DB_PATH}
+
+      # LLM
+      JARVIS_LLM_PROVIDER: ${JARVIS_LLM_PROVIDER}
+      JARVIS_LLM_API_KEY: ${JARVIS_LLM_API_KEY}
+      JARVIS_LLM_BASE_URL: ${JARVIS_LLM_BASE_URL}
+      JARVIS_LLM_MODEL: ${JARVIS_LLM_MODEL}
+
+      # OpenAI-compatible provider support
+      OPENAI_COMPATIBLE_API_BASE: ${OPENAI_COMPATIBLE_API_BASE}
+      OPENAI_COMPATIBLE_API_KEY: ${OPENAI_COMPATIBLE_API_KEY}
+
+    ports:
+      - target: 8000
+        published: "8000"
+        protocol: tcp
+        mode: ingress
+
+    restart: unless-stopped
+
+    volumes:
+      - type: bind
+        source: /opt/jarvis/brain-data
+        target: /app/data
+        bind:
+          create_host_path: true
+
+    networks:
+      - jarvis_net
 
 networks:
   jarvis_net:
+    name: jarvis_net
     external: true
