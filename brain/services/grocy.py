@@ -2,28 +2,36 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 
 class GrocyError(Exception):
-    """Generic Grocy client error."""
+    pass
 
 
-@dataclass
+def _env(name: str) -> str:
+    return (os.getenv(name, "") or "").strip()
+
+
+@dataclass(frozen=True)
 class GrocyInstanceConfig:
     name: str
     base_url: str
     api_key: str
 
 
-class _SingleGrocyClient:
-    """
-    Thin wrapper around a single Grocy instance.
-    """
+def _load_instance(name: str) -> Optional[GrocyInstanceConfig]:
+    base_url = _env(f"GROCY_{name.upper()}_BASE_URL")
+    api_key = _env(f"GROCY_{name.upper()}_API_KEY")
+    if not base_url or not api_key:
+        return None
+    return GrocyInstanceConfig(name=name, base_url=base_url, api_key=api_key)
 
-    def __init__(self, config: GrocyInstanceConfig, timeout: float = 10.0) -> None:
+
+class _SingleGrocyClient:
+    def __init__(self, config: GrocyInstanceConfig, timeout: float = 20.0) -> None:
         self.config = config
         self.timeout = timeout
 
@@ -32,12 +40,14 @@ class _SingleGrocyClient:
         method: str,
         path: str,
         params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
     ) -> Any:
         url = self.config.base_url.rstrip("/") + path
         headers = {
             "GROCY-API-KEY": self.config.api_key,
             "Accept": "application/json",
         }
+
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
                 resp = await client.request(
@@ -45,280 +55,195 @@ class _SingleGrocyClient:
                     url,
                     headers=headers,
                     params=params,
+                    json=json_body,
                 )
-            except httpx.RequestError as exc:  # type: ignore[attr-defined]
+            except httpx.RequestError as exc:
                 raise GrocyError(
-                    f"Error while requesting Grocy at {url}: {exc}"
+                    f"Request error talking to Grocy '{self.config.name}': {exc}"
                 ) from exc
 
         if resp.status_code >= 400:
+            try:
+                body = resp.json()
+            except Exception:
+                body = resp.text
             raise GrocyError(
-                f"Grocy API error {resp.status_code} for {url}: {resp.text}"
+                f"Grocy '{self.config.name}' returned {resp.status_code} for {method} {path}: {body}"
             )
+
+        if not resp.content:
+            return None
 
         try:
             return resp.json()
-        except ValueError as exc:
-            raise GrocyError(
-                f"Invalid JSON from Grocy at {url}: {resp.text[:200]}"
-            ) from exc
+        except Exception:
+            return resp.text
 
-    async def health(self) -> Dict[str, Any]:
-        """
-        Basic health info from /api/system/info.
-        """
-        return await self._request("GET", "/api/system/info")
+    async def health(self) -> Any:
+        return await self._request("GET", "/api/system/config")
 
-    async def get_stock_overview(self) -> Dict[str, Any]:
-        """
-        Stock overview from /api/stock/volatile.
-        """
+    async def get_stock_volatile(self) -> Any:
         return await self._request("GET", "/api/stock/volatile")
 
     async def get_shopping_list(self) -> Any:
-        """
-        Consolidated shopping list from /api/stock/shoppinglist.
-        """
-        return await self._request("GET", "/api/stock/shoppinglist")
+        try:
+            return await self._request("GET", "/api/stock/shoppinglist")
+        except GrocyError as exc:
+            msg = str(exc)
+            if "returned 405" not in msg and "returned 404" not in msg:
+                raise
+
+        try:
+            return await self._request("POST", "/api/stock/shoppinglist", json_body={})
+        except GrocyError as exc:
+            msg = str(exc)
+            if "returned 405" not in msg and "returned 404" not in msg:
+                raise
+
+        try:
+            return await self._request("GET", "/api/objects/shopping_list")
+        except GrocyError as exc:
+            msg = str(exc)
+            if "returned 404" not in msg:
+                raise
+
+        return await self._request("GET", "/api/objects/shopping_list_item")
 
     async def get_products(self) -> Any:
-        """
-        All products from /api/objects/products.
-        """
         return await self._request("GET", "/api/objects/products")
 
     async def get_locations(self) -> Any:
-        """
-        All locations from /api/objects/locations.
-        """
         return await self._request("GET", "/api/objects/locations")
+
+    async def get_quantity_units(self) -> Any:
+        return await self._request("GET", "/api/objects/quantity_units")
+
+    async def create_product(self, payload: Dict[str, Any]) -> Any:
+        return await self._request("POST", "/api/objects/products", json_body=payload)
+
+    async def create_product_barcode(self, payload: Dict[str, Any]) -> Any:
+        return await self._request(
+            "POST", "/api/objects/product_barcodes", json_body=payload
+        )
+
+    async def add_stock(self, product_id: int, payload: Dict[str, Any]) -> Any:
+        return await self._request(
+            "POST", f"/api/stock/products/{product_id}/add", json_body=payload
+        )
 
 
 class GrocyClient:
-    """
-    High-level client which can talk to one or two Grocy instances.
-
-    Instances are keyed by:
-      - "home_a"
-      - "home_b"
-
-    At least one instance must be configured for the client to be usable.
-    """
-
     def __init__(self, instances: Dict[str, _SingleGrocyClient]) -> None:
-        if not instances:
-            raise GrocyError("No Grocy instances configured")
         self.instances = instances
 
-    def _select_instances(
-        self,
-        household: Optional[str],
-    ) -> Dict[str, _SingleGrocyClient]:
-        """
-        Decide which instances to query based on requested household.
+    def _select_instances(self, household: str) -> List[Tuple[str, _SingleGrocyClient]]:
+        h = (household or "").strip().lower()
+        if h not in {"home_a", "home_b", "all"}:
+            raise GrocyError("household must be 'home_a', 'home_b', or 'all'")
 
-        household:
-          - "home_a" -> only A
-          - "home_b" -> only B
-          - "all" / None / "" -> all configured
-        """
-        if not household or household == "all":
-            return self.instances
+        if h == "all":
+            return list(self.instances.items())
 
-        if household not in self.instances:
-            raise GrocyError(f"Requested household '{household}' is not configured")
+        if h not in self.instances:
+            raise GrocyError(f"Grocy instance for household '{h}' is not configured")
+        return [(h, self.instances[h])]
 
-        return {household: self.instances[household]}
+    def _get_single_instance(self, household: str) -> _SingleGrocyClient:
+        h = (household or "").strip().lower()
+        if h not in {"home_a", "home_b"}:
+            raise GrocyError("household must be 'home_a' or 'home_b' for write operations")
+        if h not in self.instances:
+            raise GrocyError(f"Grocy instance for household '{h}' is not configured")
+        return self.instances[h]
 
     async def health(self) -> Dict[str, Any]:
-        """
-        Return health info per configured instance.
-        """
         results: Dict[str, Any] = {}
-        for key, client in self.instances.items():
+        for name, client in self.instances.items():
             try:
                 info = await client.health()
-                results[key] = {"status": "ok", "info": info}
+                results[name] = {"status": "ok", "info": info}
             except GrocyError as exc:
-                results[key] = {"status": "error", "error": str(exc)}
-
+                results[name] = {"status": "error", "error": str(exc)}
         return results
 
-    async def get_stock_overview(
-        self,
-        household: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        Fetch stock overview from one or more instances and merge the results.
+    async def get_stock_overview(self, household: str) -> Any:
+        payload: Dict[str, Any] = {}
+        for name, client in self._select_instances(household):
+            payload[name] = await client.get_stock_volatile()
+        return payload if household == "all" else payload[household]
 
-        List-like values (e.g. stock items) are concatenated;
-        non-list values are taken from the first instance queried.
-
-        Each stock item gets an extra "household" field.
-        """
-        instances = self._select_instances(household)
-        merged: Dict[str, Any] = {}
-        first = True
-
-        for name, client in instances.items():
-            data = await client.get_stock_overview()
-            for key, value in data.items():
-                if isinstance(value, list):
-                    items = []
-                    for item in value:
-                        if isinstance(item, dict):
-                            # annotate each item with its household
-                            item = {**item, "household": name}
-                        items.append(item)
-                    merged.setdefault(key, []).extend(items)
-                else:
-                    if first:
-                        merged[key] = value
-            first = False
-
-        return merged
-
-    async def get_shopping_list(
-        self,
-        household: Optional[str] = None,
-    ) -> Any:
-        """
-        Fetch shopping list from one or more instances and merge.
-
-        Behavior is similar to get_stock_overview:
-        list-like values are concatenated, non-lists come from the first.
-        """
-        instances = self._select_instances(household)
-        merged: Dict[str, Any] = {}
-        first = True
-
-        for name, client in instances.items():
+    async def get_shopping_list(self, household: str) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        for name, client in self._select_instances(household):
             data = await client.get_shopping_list()
-
             if isinstance(data, list):
-                # Simple list (older Grocy versions)
-                items = []
                 for item in data:
-                    if isinstance(item, dict):
-                        item = {**item, "household": name}
-                    items.append(item)
-                merged.setdefault("items", []).extend(items)
-
-            elif isinstance(data, dict):
-                for key, value in data.items():
-                    if isinstance(value, list):
-                        items = []
-                        for item in value:
-                            if isinstance(item, dict):
-                                item = {**item, "household": name}
-                            items.append(item)
-                        merged.setdefault(key, []).extend(items)
-                    else:
-                        if first:
-                            merged[key] = value
+                    merged.append({**item, "household": name})
             else:
-                if first:
-                    merged["raw"] = data
-
-            first = False
-
+                merged.append({"value": data, "household": name})
         return merged
 
-    async def get_products(
-        self,
-        household: Optional[str] = None,
-    ) -> Any:
-        """
-        Fetch products from one or more instances and merge them into a single list.
-        Each product gets an extra "household" field.
-        """
-        instances = self._select_instances(household)
-        products: List[Any] = []
-
-        for name, client in instances.items():
+    async def get_products(self, household: str) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        for name, client in self._select_instances(household):
             data = await client.get_products()
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict):
-                        item = {**item, "household": name}
-                    products.append(item)
-            else:
-                products.append({"household": name, "data": data})
+            for p in data:
+                merged.append({**p, "household": name})
+        return merged
 
-        return products
-
-    async def get_locations(
-        self,
-        household: Optional[str] = None,
-    ) -> Any:
-        """
-        Fetch locations from one or more instances and merge into a single list.
-        Each location gets a "household" field.
-        """
-        instances = self._select_instances(household)
-        locations: List[Any] = []
-
-        for name, client in instances.items():
+    async def get_locations(self, household: str) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        for name, client in self._select_instances(household):
             data = await client.get_locations()
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict):
-                        item = {**item, "household": name}
-                    locations.append(item)
-            else:
-                locations.append({"household": name, "data": data})
+            for loc in data:
+                merged.append({**loc, "household": name})
+        return merged
 
-        return locations
+    async def get_quantity_units(self, household: str) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        for name, client in self._select_instances(household):
+            data = await client.get_quantity_units()
+            for unit in data:
+                merged.append({**unit, "household": name})
+        return merged
+
+    async def create_product(
+        self,
+        household: str,
+        name: str,
+        location_id: int,
+        qu_id_purchase: int,
+        qu_id_stock: int,
+    ) -> Dict[str, Any]:
+        client = self._get_single_instance(household)
+
+        payload = {
+            "name": name,
+            "location_id": location_id,
+            "qu_id_purchase": qu_id_purchase,
+            "qu_id_stock": qu_id_stock,
+        }
+
+        created = await client.create_product(payload)
+        return {
+            "household": household,
+            **(created if isinstance(created, dict) else {"result": created}),
+        }
 
 
 async def create_grocy_client() -> GrocyClient:
-    """
-    Factory that builds a GrocyClient from environment variables.
-
-    Supported env vars:
-
-      # Backwards-compatible primary instance (Household A)
-      GROCY_BASE_URL
-      GROCY_API_KEY
-
-      # Explicit per-household config (preferred for Phase 6.5+)
-      GROCY_HOME_A_BASE_URL
-      GROCY_HOME_A_API_KEY
-      GROCY_HOME_B_BASE_URL
-      GROCY_HOME_B_API_KEY
-    """
     instances: Dict[str, _SingleGrocyClient] = {}
 
-    # Household A (or legacy single-instance)
-    home_a_base = os.getenv("GROCY_HOME_A_BASE_URL") or os.getenv("GROCY_BASE_URL")
-    home_a_key = os.getenv("GROCY_HOME_A_API_KEY") or os.getenv("GROCY_API_KEY")
-
-    if home_a_base and home_a_key:
-        instances["home_a"] = _SingleGrocyClient(
-            GrocyInstanceConfig(
-                name="home_a",
-                base_url=home_a_base,
-                api_key=home_a_key,
-            )
-        )
-
-    # Household B (new in Phase 6.5)
-    home_b_base = os.getenv("GROCY_HOME_B_BASE_URL")
-    home_b_key = os.getenv("GROCY_HOME_B_API_KEY")
-
-    if home_b_base and home_b_key:
-        instances["home_b"] = _SingleGrocyClient(
-            GrocyInstanceConfig(
-                name="home_b",
-                base_url=home_b_base,
-                api_key=home_b_key,
-            )
-        )
+    for household in ("home_a", "home_b"):
+        cfg = _load_instance(household)
+        if cfg:
+            instances[household] = _SingleGrocyClient(cfg)
 
     if not instances:
         raise GrocyError(
-            "Grocy not configured. Set GROCY_BASE_URL/GROCY_API_KEY or "
-            "GROCY_HOME_A_BASE_URL/GROCY_HOME_A_API_KEY at minimum."
+            "No Grocy instances configured. "
+            "Set GROCY_HOME_A_BASE_URL / GROCY_HOME_A_API_KEY "
+            "and/or GROCY_HOME_B_BASE_URL / GROCY_HOME_B_API_KEY."
         )
 
-    return GrocyClient(instances)
+    return GrocyClient(instances=instances)

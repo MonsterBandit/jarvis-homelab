@@ -13,16 +13,28 @@ class BarcodeBuddyClient:
     """
     Lightweight async client for Barcode Buddy.
 
-    We primarily use:
-      - GET /api/system/info           -> health
-      - GET /api/action/scan?add=CODE -> pass a barcode to BB
+    IMPORTANT ARCHITECTURAL NOTE
+    ----------------------------
+    This client is intentionally **SCAN-ONLY**.
+
+    BarcodeBuddy is used to:
+      - scan barcodes
+      - detect unknown / known items
+      - increment quantities via its own UI if desired
+
+    All authoritative inventory mutation lives in **Grocy**:
+      - product creation
+      - barcode linking
+      - stock adds / removals
+
+    Do NOT add product-creation or barcode-linking logic here.
     """
 
     def __init__(self, base_url: str, api_key: Optional[str] = None, timeout: float = 10.0) -> None:
         if not base_url:
             raise BarcodeBuddyError("BARCODEBUDDY_BASE_URL is not configured")
 
-        self.base_url = base_url.rstrip("/")  # e.g. https://barcode.plexmoose.com
+        self.base_url = base_url.rstrip("/")
         self.api_key = api_key or ""
         self.timeout = timeout
 
@@ -30,7 +42,6 @@ class BarcodeBuddyClient:
         headers: Dict[str, str] = {}
         params: Dict[str, Any] = dict(extra_params or {})
 
-        # The API key can be sent as header **or** GET param.
         if self.api_key:
             headers["BBUDDY-API-KEY"] = self.api_key
             params.setdefault("apikey", self.api_key)
@@ -61,28 +72,25 @@ class BarcodeBuddyClient:
 
         if resp.status_code >= 400:
             snippet = resp.text[:200]
-            raise BarcodeBuddyError(f"BarcodeBuddy returned HTTP {resp.status_code} for {url}: {snippet}")
+            raise BarcodeBuddyError(
+                f"BarcodeBuddy returned HTTP {resp.status_code} for {url}: {snippet}"
+            )
 
         content_type = resp.headers.get("content-type", "")
         if "application/json" in content_type:
             return resp.json()
 
-        # Some endpoints may just return text / HTML
         return resp.text
 
-    # ---------- High-level methods ----------
-
     async def health(self) -> Any:
-        """Return Barcode Buddy system info (GET /api/system/info)."""
+        """Return Barcode Buddy system info."""
         return await self._request("GET", "/system/info")
 
     async def scan_barcode(self, barcode: str) -> Any:
         """
         Pass a single barcode to Barcode Buddy.
 
-        Docs: /api/action/scan supports GET parameter `add`.
-        Example:
-          /api/action/scan?add=123456
+        GET /api/action/scan?add=<barcode>
         """
         if not barcode:
             raise BarcodeBuddyError("Barcode cannot be empty")
@@ -90,16 +98,7 @@ class BarcodeBuddyClient:
         return await self._request("GET", "/action/scan", params={"add": barcode})
 
 
-# ---------- Factory helpers for FastAPI dependencies ----------
-
-
 def _get_barcodebuddy_settings() -> Optional[Dict[str, str]]:
-    """
-    Read settings from environment.
-
-    Return None if BARCODEBUDDY_BASE_URL is not set so the API
-    can report 'disabled' instead of crashing.
-    """
     base_url = os.getenv("BARCODEBUDDY_BASE_URL", "").strip()
     api_key = os.getenv("BARCODEBUDDY_API_KEY", "").strip()
 
@@ -121,7 +120,5 @@ def _barcodebuddy_client_singleton() -> BarcodeBuddyClient:
 
 
 async def create_barcodebuddy_client() -> BarcodeBuddyClient:
-    """
-    Kept for compatibility; returns a singleton client.
-    """
+    """FastAPI dependency factory."""
     return _barcodebuddy_client_singleton()

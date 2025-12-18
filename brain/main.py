@@ -20,7 +20,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from model_client import (
     GeminiModelClient,
@@ -431,7 +431,6 @@ def _parse_location_ids(env_name: str) -> List[int]:
         try:
             ids.append(int(part))
         except ValueError:
-            # Ignore invalid entries instead of crashing
             continue
     return ids
 
@@ -446,12 +445,6 @@ def filter_stock_by_household(
 ) -> List[Dict[str, Any]]:
     """
     Filter stock items by household using Grocy location IDs.
-
-    - household="home_a" -> GROCY_HOME_A_LOCATION_IDS
-    - household="home_b" -> GROCY_HOME_B_LOCATION_IDS
-    - household=None or "all" -> no filtering
-
-    If env vars are not set, returns stock unfiltered.
     """
     if household in (None, "", "all"):
         return stock_items
@@ -461,14 +454,59 @@ def filter_stock_by_household(
     elif household == "home_b" and GROCY_HOME_B_LOCATION_IDS:
         allowed = set(GROCY_HOME_B_LOCATION_IDS)
     else:
-        # Unknown household or no config; fall back to unfiltered
         return stock_items
 
-    return [
-        item
-        for item in stock_items
-        if item.get("location_id") in allowed
-    ]
+    return [item for item in stock_items if item.get("location_id") in allowed]
+
+
+def _require_household_query(household: Optional[str]) -> str:
+    """
+    Gate A + Phase 6.4 rule:
+    For Grocy read endpoints, we do NOT guess intent.
+    Callers must explicitly provide household=home_a|home_b|all.
+    """
+    if household is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Query parameter 'household' is required: home_a | home_b | all",
+        )
+    h = (household or "").strip().lower()
+    if h not in {"home_a", "home_b", "all"}:
+        raise HTTPException(
+            status_code=400,
+            detail="household must be 'home_a', 'home_b', or 'all'",
+        )
+    return h
+
+
+# ---------------------------------------------------------
+# Safe async method resolution (for Grocy + BarcodeBuddy)
+# ---------------------------------------------------------
+
+
+async def _acall_first_existing(
+    obj: Any,
+    method_names: List[str],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    for name in method_names:
+        fn = getattr(obj, name, None)
+        if fn is None:
+            continue
+        if callable(fn):
+            return await fn(*args, **kwargs)
+
+    available = [m for m in dir(obj) if not m.startswith("_")]
+    raise HTTPException(
+        status_code=500,
+        detail={
+            "error": "Expected service method not found",
+            "tried": method_names,
+            "service_type": type(obj).__name__,
+            "available_sample": available[:60],
+        },
+    )
 
 
 # ----------------------------
@@ -480,17 +518,11 @@ health_router = APIRouter(prefix="/health", tags=["health"])
 
 @health_router.get("/ping")
 async def ping() -> Dict[str, Any]:
-    """
-    Simple liveness check.
-    """
     return {"status": "ok", "message": "ISAC brain is alive"}
 
 
 @health_router.get("/system")
 async def system_health() -> Dict[str, Any]:
-    """
-    Basic system health metrics: hostname, uptime, CPU, memory, etc.
-    """
     hostname = socket.gethostname()
     boot_time = datetime.fromtimestamp(psutil.boot_time(), tz=timezone.utc)
     now = datetime.now(timezone.utc)
@@ -530,9 +562,6 @@ async def system_health() -> Dict[str, Any]:
 
 @health_router.get("/database")
 async def database_health() -> Dict[str, Any]:
-    """
-    Simple check that the SQLite DB file exists and is readable.
-    """
     start = time.time()
     exists = Path(DB_PATH).is_file()
     duration = time.time() - start
@@ -564,9 +593,6 @@ async def database_health() -> Dict[str, Any]:
 
 @health_router.get("/homeassistant")
 async def homeassistant_health() -> Dict[str, Any]:
-    """
-    Check connectivity and basic status for Home Assistant.
-    """
     if not HA_CLIENT:
         return {
             "status": "disabled",
@@ -618,9 +644,6 @@ async def list_entities(
         description="Optional case-insensitive search across entity_id and friendly_name.",
     ),
 ) -> Dict[str, Any]:
-    """
-    List all entities (optionally filtered by domain or search text).
-    """
     client = ensure_ha_client()
     states = await client.get_states()
 
@@ -635,9 +658,7 @@ async def list_entities(
 
         if search:
             needle = search.lower()
-            if needle not in entity_id.lower() and needle not in str(
-                friendly_name
-            ).lower():
+            if needle not in entity_id.lower() and needle not in str(friendly_name).lower():
                 continue
 
         results.append(
@@ -658,9 +679,6 @@ async def list_entities(
 
 @ha_router.get("/states/{entity_id}")
 async def get_entity_state(entity_id: str) -> Dict[str, Any]:
-    """
-    Get full state details for a single entity.
-    """
     client = ensure_ha_client()
 
     entity_id = entity_id.strip()
@@ -690,16 +708,14 @@ async def call_service(
     service: str,
     data: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Call a Home Assistant service. The request body is passed directly as the service data.
-    """
     client = ensure_ha_client()
 
     domain = domain.strip()
     service = service.strip()
     if not domain or not service:
         raise HTTPException(
-            status_code=400, detail="Domain and service must not be empty"
+            status_code=400,
+            detail="Domain and service must not be empty",
         )
 
     try:
@@ -722,9 +738,6 @@ async def call_service(
 
 @ha_router.get("/summary")
 async def ha_summary() -> Dict[str, Any]:
-    """
-    High-level summary across lights, switches, and any obvious problem entities.
-    """
     client = ensure_ha_client()
     states = await client.get_states()
 
@@ -793,7 +806,7 @@ grocy_router = APIRouter(
 
 def _grocy_disabled_response(reason: Optional[str] = None) -> Dict[str, Any]:
     base_reason = (
-        "Grocy not configured (missing GROCY_BASE_URL or GROCY_API_KEY, "
+        "Grocy not configured (missing GROCY_HOME_A_* and/or GROCY_HOME_B_* env vars, "
         "or client not initialized)"
     )
     return {
@@ -818,11 +831,6 @@ async def get_grocy_client() -> Optional[GrocyClient]:
 async def grocy_health(
     client: Optional[GrocyClient] = Depends(get_grocy_client),
 ) -> Dict[str, Any]:
-    """
-    Health check for Grocy connectivity.
-
-    Returns per-household status for all configured Grocy instances.
-    """
     if client is None:
         return _grocy_disabled_response()
 
@@ -836,37 +844,31 @@ async def grocy_health(
 @grocy_router.get("/stock")
 async def grocy_stock(
     household: Optional[str] = Query(
-        default="all",
-        description="Filter by household: 'home_a', 'home_b', or 'all'.",
+        default=None,
+        description="REQUIRED. Scope by household: 'home_a', 'home_b', or explicitly 'all'.",
     ),
     client: Optional[GrocyClient] = Depends(get_grocy_client),
 ) -> Dict[str, Any]:
-    """
-    Returns a stock overview (via /api/stock/volatile) and
-    supports optional household filtering.
-
-    household controls which Grocy instance(s) to query.
-    Location-based filtering uses GROCY_HOME_A_LOCATION_IDS /
-    GROCY_HOME_B_LOCATION_IDS to further narrow the result.
-    """
     if client is None:
         return _grocy_disabled_response()
 
+    hh = _require_household_query(household)
+
     try:
-        raw = await client.get_stock_overview(household=household)
+        raw = await client.get_stock_overview(household=hh)
     except GrocyError as exc:
         return {"status": "error", "error": str(exc)}
 
     filtered_payload: Dict[str, Any] = {}
     for key, value in raw.items():
         if isinstance(value, list):
-            filtered_payload[key] = filter_stock_by_household(value, household)
+            filtered_payload[key] = filter_stock_by_household(value, hh)
         else:
             filtered_payload[key] = value
 
     return {
         "status": "ok",
-        "household": household or "all",
+        "household": hh,
         "stock": filtered_payload,
     }
 
@@ -874,22 +876,21 @@ async def grocy_stock(
 @grocy_router.get("/shopping-list")
 async def grocy_shopping_list(
     household: Optional[str] = Query(
-        default="all",
-        description="Filter by household: 'home_a', 'home_b', or 'all'.",
+        default=None,
+        description="REQUIRED. Scope by household: 'home_a', 'home_b', or explicitly 'all'.",
     ),
     client: Optional[GrocyClient] = Depends(get_grocy_client),
 ) -> Dict[str, Any]:
-    """
-    Raw consolidated shopping list from Grocy for one or more households.
-    """
     if client is None:
         return _grocy_disabled_response()
 
+    hh = _require_household_query(household)
+
     try:
-        data = await client.get_shopping_list(household=household)
+        data = await client.get_shopping_list(household=hh)
         return {
             "status": "ok",
-            "household": household or "all",
+            "household": hh,
             "shopping_list": data,
         }
     except GrocyError as exc:
@@ -899,25 +900,21 @@ async def grocy_shopping_list(
 @grocy_router.get("/products")
 async def grocy_products(
     household: Optional[str] = Query(
-        default="all",
-        description="Filter by household: 'home_a', 'home_b', or 'all'.",
+        default=None,
+        description="REQUIRED. Scope by household: 'home_a', 'home_b', or explicitly 'all'.",
     ),
     client: Optional[GrocyClient] = Depends(get_grocy_client),
 ) -> Dict[str, Any]:
-    """
-    Raw products table from Grocy, optionally scoped by household.
-
-    Each product in the list will include a 'household' field indicating
-    which Grocy instance it came from.
-    """
     if client is None:
         return _grocy_disabled_response()
 
+    hh = _require_household_query(household)
+
     try:
-        products = await client.get_products(household=household)
+        products = await client.get_products(household=hh)
         return {
             "status": "ok",
-            "household": household or "all",
+            "household": hh,
             "products": products,
         }
     except GrocyError as exc:
@@ -927,26 +924,54 @@ async def grocy_products(
 @grocy_router.get("/locations")
 async def grocy_locations(
     household: Optional[str] = Query(
-        default="all",
-        description="Filter by household: 'home_a', 'home_b', or 'all'.",
+        default=None,
+        description="REQUIRED. Scope by household: 'home_a', 'home_b', or explicitly 'all'.",
+    ),
+    client: Optional[GrocyClient] = Depends(get_grocy_client),
+) -> Dict[str, Any]:
+    if client is None:
+        return _grocy_disabled_response()
+
+    hh = _require_household_query(household)
+
+    try:
+        locations = await client.get_locations(household=hh)
+        return {
+            "status": "ok",
+            "household": hh,
+            "locations": locations,
+        }
+    except GrocyError as exc:
+        return {"status": "error", "error": str(exc)}
+
+
+# ----------------------------
+# NEW: Quantity Units endpoint (Phase 6.4 Step 4)
+# ----------------------------
+
+@grocy_router.get("/quantity-units")
+async def grocy_quantity_units(
+    household: Optional[str] = Query(
+        default=None,
+        description="REQUIRED. Scope by household: 'home_a', 'home_b', or explicitly 'all'.",
     ),
     client: Optional[GrocyClient] = Depends(get_grocy_client),
 ) -> Dict[str, Any]:
     """
-    Raw locations table from Grocy, optionally scoped by household.
-
-    Each location in the list will include a 'household' field indicating
-    which Grocy instance it came from.
+    List Grocy quantity units via /api/objects/quantity_units.
+    Required for explicit unit selection during product creation.
     """
     if client is None:
         return _grocy_disabled_response()
 
+    hh = _require_household_query(household)
+
     try:
-        locations = await client.get_locations(household=household)
+        units = await client.get_quantity_units(household=hh)
         return {
             "status": "ok",
-            "household": household or "all",
-            "locations": locations,
+            "household": hh,
+            "quantity_units": units,
         }
     except GrocyError as exc:
         return {"status": "error", "error": str(exc)}
@@ -955,37 +980,61 @@ async def grocy_locations(
 @grocy_router.get("/summary")
 async def grocy_summary(
     household: Optional[str] = Query(
-        default="all",
-        description="Filter by household: 'home_a', 'home_b', or 'all'.",
+        default=None,
+        description="REQUIRED. Scope by household: 'home_a', 'home_b', or explicitly 'all'.",
     ),
     client: Optional[GrocyClient] = Depends(get_grocy_client),
 ) -> Dict[str, Any]:
-    """
-    High-level summary combining stock + shopping list,
-    optionally scoped to a single household.
-    """
     if client is None:
         return _grocy_disabled_response()
 
+    hh = _require_household_query(household)
+
     try:
-        stock = await client.get_stock_overview(household=household)
-        shopping_list = await client.get_shopping_list(household=household)
+        stock = await client.get_stock_overview(household=hh)
+        shopping_list = await client.get_shopping_list(household=hh)
     except GrocyError as exc:
         return {"status": "error", "error": str(exc)}
 
     filtered_stock: Dict[str, Any] = {}
     for key, value in stock.items():
         if isinstance(value, list):
-            filtered_stock[key] = filter_stock_by_household(value, household)
+            filtered_stock[key] = filter_stock_by_household(value, hh)
         else:
             filtered_stock[key] = value
 
     return {
         "status": "ok",
-        "household": household or "all",
+        "household": hh,
         "stock": filtered_stock,
         "shopping_list": shopping_list,
     }
+
+
+@grocy_router.get("/combined")
+async def grocy_combined(
+    client: Optional[GrocyClient] = Depends(get_grocy_client),
+) -> Dict[str, Any]:
+    if client is None:
+        return _grocy_disabled_response()
+
+    try:
+        combined = await _acall_first_existing(
+            client,
+            [
+                "get_combined",
+                "combined_inventory",
+                "get_combined_inventory",
+                "combined",
+            ],
+        )
+        return {"status": "ok", "combined": combined}
+    except HTTPException:
+        raise
+    except GrocyError as exc:
+        return {"status": "error", "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "error": str(exc)}
 
 
 def _normalize_name(name: str) -> str:
@@ -996,10 +1045,6 @@ def _build_inventory_index_with_names(
     stock_payload: Dict[str, Any],
     household: str,
 ) -> Tuple[Dict[str, float], Dict[str, str]]:
-    """
-    Build an index of stock keyed by normalized product name plus a mapping
-    of normalized_name -> display_name for reporting.
-    """
     raw_items: List[Dict[str, Any]] = []
     for value in stock_payload.values():
         if isinstance(value, list):
@@ -1033,15 +1078,6 @@ def _build_inventory_index_with_names(
 async def grocy_compare(
     client: Optional[GrocyClient] = Depends(get_grocy_client),
 ) -> Dict[str, Any]:
-    """
-    Compare inventories between home_a and home_b.
-
-    Returns:
-    - only_home_a: items that only exist in home_a
-    - only_home_b: items that only exist in home_b
-    - both: items present in both, with amounts and delta
-    - diffs: subset of 'both' where amounts differ
-    """
     if client is None:
         return _grocy_disabled_response()
 
@@ -1114,6 +1150,80 @@ async def grocy_compare(
 
 
 # ----------------------------
+# Grocy product write parity (Phase 6.4 Step 4) - Units Fix
+# ----------------------------
+
+class GrocyCreateProductRequest(BaseModel):
+    name: str = Field(..., min_length=1, description="Product name")
+    location_id: int = Field(..., ge=1, description="Grocy location_id to assign to the product")
+    qu_id_purchase: int = Field(..., ge=1, description="Grocy purchase unit ID (required)")
+    qu_id_stock: int = Field(..., ge=1, description="Grocy stock unit ID (required)")
+
+
+@grocy_router.post("/products/{household}")
+async def grocy_create_product(
+    household: str,
+    body: GrocyCreateProductRequest,
+    client: Optional[GrocyClient] = Depends(get_grocy_client),
+) -> Dict[str, Any]:
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Grocy client not configured; create product unavailable.",
+        )
+
+    hh = (household or "").strip().lower()
+    if hh not in {"home_a", "home_b"}:
+        raise HTTPException(
+            status_code=400,
+            detail="household must be 'home_a' or 'home_b' for write operations",
+        )
+
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name must not be empty")
+
+    try:
+        created = await client.create_product(
+            household=hh,
+            name=name,
+            location_id=body.location_id,
+            qu_id_purchase=body.qu_id_purchase,
+            qu_id_stock=body.qu_id_stock,
+        )
+    except GrocyError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error creating product in Grocy: {exc}",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error creating product: {exc}",
+        ) from exc
+
+    product_id: Optional[int] = None
+    if isinstance(created, dict):
+        pid = (
+            created.get("id")
+            or created.get("product_id")
+            or created.get("created_object_id")
+        )
+        if pid is not None:
+            try:
+                product_id = int(pid)
+            except (TypeError, ValueError):
+                product_id = None
+
+    return {
+        "status": "ok",
+        "household": hh,
+        "product_id": product_id,
+        "product": created,
+    }
+
+
+# ----------------------------
 # Jarvis-managed shopping lists
 # ----------------------------
 
@@ -1144,10 +1254,6 @@ async def jarvis_shopping_list_get(
         description="If true, include completed items as well.",
     ),
 ) -> Dict[str, Any]:
-    """
-    Return the Jarvis-managed shopping list for a given household
-    ('home_a', 'home_b', or 'shared').
-    """
     hh = _normalize_list_household(household)
     items = get_shopping_list_items(hh, include_completed=include_completed)
     return {
@@ -1162,10 +1268,6 @@ async def jarvis_shopping_list_add(
     household: str,
     body: ShoppingListCreateRequest,
 ) -> Dict[str, Any]:
-    """
-    Append a new item to the Jarvis-managed shopping list
-    for the given household.
-    """
     hh = _normalize_list_household(household)
     item_id = add_shopping_list_item(
         household=hh,
@@ -1187,9 +1289,6 @@ async def jarvis_shopping_list_delete_item(
     household: str,
     item_id: int,
 ) -> Dict[str, Any]:
-    """
-    Delete a single shopping list item for the given household.
-    """
     hh = _normalize_list_household(household)
     deleted = delete_shopping_list_item(hh, item_id)
     if not deleted:
@@ -1207,9 +1306,6 @@ async def jarvis_shopping_list_delete_item(
 async def jarvis_shopping_list_clear(
     household: str,
 ) -> Dict[str, Any]:
-    """
-    Clear all shopping list items for the given household.
-    """
     hh = _normalize_list_household(household)
     deleted_count = clear_shopping_list(hh)
     return {
@@ -1259,6 +1355,7 @@ class MealPlanResponse(BaseModel):
     plan: List[PlannedMeal]
     shopping_list: List[ShoppingListItem]
     list_household: Optional[str] = None
+    week_layout: Dict[str, List[PlannedMeal]] = Field(default_factory=dict)
 
 
 class HouseholdMealPlan(BaseModel):
@@ -1266,6 +1363,7 @@ class HouseholdMealPlan(BaseModel):
     plan: List[PlannedMeal]
     shopping_list: List[ShoppingListItem]
     list_household: Optional[str] = None
+    week_layout: Dict[str, List[PlannedMeal]] = Field(default_factory=dict)
 
 
 class MultiMealPlanRequest(BaseModel):
@@ -1284,8 +1382,6 @@ class MultiMealPlanResponse(BaseModel):
     combined_shopping_all: List[ShoppingListItem]
 
 
-# A small placeholder recipe library. In future phases this can move into
-# the database or a dedicated recipes service.
 RECIPE_LIBRARY: List[Dict[str, Any]] = [
     {
         "id": "pasta_bake",
@@ -1324,13 +1420,6 @@ def _build_inventory_index(
     stock_payload: Dict[str, Any],
     household: str,
 ) -> Dict[str, float]:
-    """
-    Build a simple index of available stock keyed by normalized product name.
-
-    We attempt to be defensive about the exact Grocy schema by looking for
-    any list-valued fields in the stock payload and treating them as stock
-    rows that may contain "product" and "amount" fields.
-    """
     raw_items: List[Dict[str, Any]] = []
     for value in stock_payload.values():
         if isinstance(value, list):
@@ -1360,10 +1449,6 @@ def _evaluate_recipe_against_inventory(
     inventory_index: Dict[str, float],
     household: str,
 ) -> Dict[str, Any]:
-    """
-    Compare a single recipe against a household's inventory index and return
-    whether it is cookable plus any missing ingredients.
-    """
     missing: List[ShoppingListItem] = []
     for ingredient in recipe.get("ingredients", []):
         ing_name = str(ingredient.get("name", "")).strip()
@@ -1388,6 +1473,36 @@ def _evaluate_recipe_against_inventory(
     }
 
 
+WEEKDAY_KEYS: List[str] = [
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+]
+
+
+def _build_week_layout(plan: List[PlannedMeal]) -> Dict[str, List[PlannedMeal]]:
+    layout: Dict[str, List[PlannedMeal]] = {day: [] for day in WEEKDAY_KEYS}
+    layout["unscheduled"] = []
+
+    for meal in plan:
+        if meal.date is None:
+            layout["unscheduled"].append(meal)
+            continue
+
+        weekday_index = meal.date.weekday()
+        if 0 <= weekday_index < len(WEEKDAY_KEYS):
+            day_key = WEEKDAY_KEYS[weekday_index]
+        else:
+            day_key = "unscheduled"
+        layout[day_key].append(meal)
+
+    return layout
+
+
 mealplanner_router = APIRouter(
     prefix="/mealplanner",
     tags=["mealplanner"],
@@ -1400,14 +1515,6 @@ async def generate_meal_plan(
     body: MealPlanRequest,
     client: Optional[GrocyClient] = Depends(get_grocy_client),
 ) -> MealPlanResponse:
-    """
-    Generate a simple per-household meal plan based on Grocy stock and a
-    small built-in recipe library.
-
-    When persist_to_list is true, all missing ingredients from selected
-    recipes are deduplicated and written into the Jarvis shopping list
-    for the specified list_household (or the same household by default).
-    """
     if client is None:
         raise HTTPException(
             status_code=503,
@@ -1423,9 +1530,7 @@ async def generate_meal_plan(
 
     target_list_household: Optional[str] = None
     if body.persist_to_list:
-        target_list_household = _normalize_list_household(
-            body.list_household or household
-        )
+        target_list_household = _normalize_list_household(body.list_household or household)
 
     try:
         stock_payload = await client.get_stock_overview(household=household)
@@ -1444,9 +1549,7 @@ async def generate_meal_plan(
     nonveg_recipes: List[Dict[str, Any]] = []
 
     for recipe in RECIPE_LIBRARY:
-        eval_result = _evaluate_recipe_against_inventory(
-            recipe, inventory_index, household
-        )
+        eval_result = _evaluate_recipe_against_inventory(recipe, inventory_index, household)
         recipe_entry = {
             "recipe": recipe,
             "ready": eval_result["ready"],
@@ -1544,11 +1647,14 @@ async def generate_meal_plan(
                 source="mealplanner",
             )
 
+    week_layout = _build_week_layout(planned_meals)
+
     return MealPlanResponse(
         household=household,
         plan=planned_meals,
         shopping_list=shopping_list_items,
         list_household=target_list_household,
+        week_layout=week_layout,
     )
 
 
@@ -1557,15 +1663,6 @@ async def generate_multi_meal_plan(
     body: MultiMealPlanRequest,
     client: Optional[GrocyClient] = Depends(get_grocy_client),
 ) -> MultiMealPlanResponse:
-    """
-    Generate meal plans for multiple households at once and return
-    combined shopping views.
-
-    - Reuses the /mealplanner/plan logic internally for each household.
-    - persist_to_lists=True will write items into Jarvis shopping lists:
-      * If list_household is set, all items go there.
-      * Otherwise each household writes into its own matching list.
-    """
     if client is None:
         raise HTTPException(
             status_code=503,
@@ -1609,25 +1706,34 @@ async def generate_multi_meal_plan(
                 plan=single_plan.plan,
                 shopping_list=single_plan.shopping_list,
                 list_household=single_plan.list_household,
+                week_layout=single_plan.week_layout,
             )
         )
         all_items.extend(single_plan.shopping_list)
 
-    combined_by_home: Dict[str, Dict[Tuple[str, str], ShoppingListItem]] = {}
+    HOUSEHOLD_BUCKETS = ["home_a", "home_b", "shared"]
+    combined_by_home: Dict[str, Dict[Tuple[str, str], ShoppingListItem]] = {
+        bucket: {} for bucket in HOUSEHOLD_BUCKETS
+    }
+
     for item in all_items:
         item_name = (item.name or "").strip()
         if not item_name:
             continue
-        home_tag = (item.home or "").strip().lower() or "unknown"
+        home_tag = (item.home or "").strip().lower()
+        if home_tag not in {"home_a", "home_b"}:
+            home_tag = "shared"
+
         key = (item_name.lower(), home_tag)
-        if home_tag not in combined_by_home:
-            combined_by_home[home_tag] = {}
         if key not in combined_by_home[home_tag]:
             combined_by_home[home_tag][key] = item
 
-    combined_shopping_by_household: Dict[str, List[ShoppingListItem]] = {
-        home: list(items.values()) for home, items in combined_by_home.items()
-    }
+    combined_shopping_by_household: Dict[str, List[ShoppingListItem]] = {}
+    for home in HOUSEHOLD_BUCKETS:
+        items_dict = combined_by_home.get(home, {})
+        items_list = list(items_dict.values())
+        items_list.sort(key=lambda i: (i.name or "").lower())
+        combined_shopping_by_household[home] = items_list
 
     dedup_all: Dict[str, ShoppingListItem] = {}
     for item in all_items:
@@ -1637,7 +1743,8 @@ async def generate_multi_meal_plan(
         if name_key not in dedup_all:
             dedup_all[name_key] = item
 
-    combined_shopping_all = list(dedup_all.values())
+    combined_shopping_all: List[ShoppingListItem] = list(dedup_all.values())
+    combined_shopping_all.sort(key=lambda i: (i.name or "").lower())
 
     return MultiMealPlanResponse(
         households=normalized_households,
@@ -1682,13 +1789,28 @@ class BarcodeScanRequest(BaseModel):
     household: Optional[str] = None
 
 
+class BarcodeCreateProductRequest(BaseModel):
+    barcode: str = Field(..., min_length=1)
+    household: str = Field(..., description="home_a | home_b")
+    name: str = Field(..., min_length=1)
+    location_id: int = Field(..., ge=1)
+
+    # NEW: required unit IDs (Gate A: no defaults)
+    qu_id_purchase: int = Field(..., ge=1, description="Grocy purchase unit ID (required)")
+    qu_id_stock: int = Field(..., ge=1, description="Grocy stock unit ID (required)")
+
+    add_stock: bool = False
+    quantity: Optional[float] = Field(default=None, gt=0)
+
+    best_before_date: Optional[str] = None
+    purchased_date: Optional[str] = None
+    price: Optional[float] = Field(default=None, gt=0)
+
+
 @barcode_router.get("/health")
 async def barcode_health(
     client: Optional[BarcodeBuddyClient] = Depends(get_barcode_client),
 ) -> Dict[str, Any]:
-    """
-    Health check for BarcodeBuddy connectivity.
-    """
     if client is None:
         return _barcode_disabled_response()
 
@@ -1703,11 +1825,6 @@ async def barcode_health(
 async def barcode_products(
     client: Optional[BarcodeBuddyClient] = Depends(get_barcode_client),
 ) -> Dict[str, Any]:
-    """
-    Placeholder endpoint – the current BarcodeBuddy client does not expose
-    a stable "list all products" API. This avoids crashes but reports that
-    listing is not supported yet.
-    """
     if client is None:
         return _barcode_disabled_response()
 
@@ -1722,12 +1839,6 @@ async def barcode_product_lookup(
     barcode: str,
     client: Optional[BarcodeBuddyClient] = Depends(get_barcode_client),
 ) -> Dict[str, Any]:
-    """
-    Lookup a barcode via BarcodeBuddy by issuing a scan action.
-
-    This effectively acts like a remote scanner call and returns the raw
-    result from BarcodeBuddy (HTML or JSON depending on configuration).
-    """
     if client is None:
         return _barcode_disabled_response()
 
@@ -1742,20 +1853,52 @@ async def barcode_product_lookup(
         return {"status": "error", "error": str(exc)}
 
 
+def _summarize_barcodebuddy_result(raw: Dict[str, Any]) -> Dict[str, Any]:
+    text_parts: List[str] = []
+
+    data = raw.get("data")
+    if isinstance(data, dict):
+        msg = data.get("result")
+        if msg:
+            text_parts.append(str(msg))
+
+    result_block = raw.get("result")
+    if isinstance(result_block, dict):
+        msg2 = result_block.get("result")
+        if msg2:
+            text_parts.append(str(msg2))
+
+    full_text = " ".join(text_parts).strip()
+    lower = full_text.lower()
+
+    state = "unknown"
+    can_offer_grocy_add = False
+
+    if "unknown product already scanned" in lower:
+        state = "unknown_already_scanned"
+        can_offer_grocy_add = True
+    elif "unknown product" in lower:
+        state = "unknown"
+        can_offer_grocy_add = True
+    elif "increasing quantity" in lower or "quantity increased" in lower:
+        state = "quantity_incremented"
+    elif "added to stock" in lower or "added to inventory" in lower:
+        state = "added_to_stock"
+    elif "ok" in lower and not full_text:
+        state = "ok"
+
+    return {
+        "state": state,
+        "message": full_text or None,
+        "can_offer_grocy_add": can_offer_grocy_add,
+    }
+
+
 @barcode_router.post("/scan")
 async def barcode_scan(
     body: BarcodeScanRequest,
     client: Optional[BarcodeBuddyClient] = Depends(get_barcode_client),
 ) -> Dict[str, Any]:
-    """
-    High-level scan endpoint for future inventory builder workflows.
-
-    - Takes a barcode (and optional household context)
-    - Forwards it to BarcodeBuddy /action/scan
-    - Returns the raw result (HTML or JSON) without yet modifying Grocy
-      directly from within ISAC (BarcodeBuddy itself may still act
-      depending on its configured mode).
-    """
     if client is None:
         raise HTTPException(
             status_code=503,
@@ -1777,11 +1920,144 @@ async def barcode_scan(
             detail=f"Error querying BarcodeBuddy: {exc}",
         ) from exc
 
+    summary: Dict[str, Any]
+    if isinstance(raw, dict):
+        summary = _summarize_barcodebuddy_result(raw)
+    else:
+        summary = {
+            "state": "unknown",
+            "message": None,
+            "can_offer_grocy_add": False,
+        }
+
     return {
         "status": "ok",
         "barcode": barcode,
         "household": body.household,
         "raw_result": raw,
+        "summary": summary,
+    }
+
+
+@barcode_router.post("/create-product")
+async def barcode_create_product(
+    body: BarcodeCreateProductRequest,
+    bb_client: Optional[BarcodeBuddyClient] = Depends(get_barcode_client),
+    grocy_client: Optional[GrocyClient] = Depends(get_grocy_client),
+) -> Dict[str, Any]:
+    if bb_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="BarcodeBuddy client not configured; create-product unavailable.",
+        )
+    if grocy_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Grocy client not configured; create-product unavailable.",
+        )
+
+    household = (body.household or "").strip().lower()
+    if household not in {"home_a", "home_b"}:
+        raise HTTPException(
+            status_code=400,
+            detail="household must be 'home_a' or 'home_b'",
+        )
+
+    if body.add_stock and body.quantity is None:
+        raise HTTPException(
+            status_code=400,
+            detail="quantity is required when add_stock=true",
+        )
+
+    created = await _acall_first_existing(
+        grocy_client,
+        [
+            "create_product",
+            "create_product_in_household",
+            "create_product_with_location",
+            "create_product_and_link_barcode",
+            "create_product_for_household",
+        ],
+        household=household,
+        name=body.name,
+        location_id=body.location_id,
+        qu_id_purchase=body.qu_id_purchase,
+        qu_id_stock=body.qu_id_stock,
+    )
+
+    product_id: Optional[int] = None
+    if isinstance(created, dict):
+        pid = (
+            created.get("product_id")
+            or created.get("id")
+            or (created.get("product") or {}).get("id")
+        )
+        if pid is not None:
+            try:
+                product_id = int(pid)
+            except (TypeError, ValueError):
+                product_id = None
+
+    if product_id is None:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Could not determine product_id from Grocy create response",
+                "created": created,
+            },
+        )
+
+    barcode_link = await _acall_first_existing(
+        grocy_client,
+        [
+            "link_barcode",
+            "link_barcode_to_product",
+            "create_product_barcode",
+            "create_product_barcode_link",
+            "add_barcode",
+        ],
+        barcode=body.barcode,
+        household=household,
+        product_id=product_id,
+    )
+
+    stock_result: Optional[Any] = None
+    if body.add_stock:
+        stock_result = await _acall_first_existing(
+            grocy_client,
+            [
+                "add_stock",
+                "add_product_stock",
+                "add_stock_to_product",
+                "stock_add",
+                "add_stock_for_product",
+            ],
+            household=household,
+            product_id=product_id,
+            quantity=body.quantity,
+            best_before_date=body.best_before_date,
+            purchased_date=body.purchased_date,
+            price=body.price,
+        )
+
+    return {
+        "status": "ok",
+        "household": household,
+        "barcode": body.barcode,
+        "product_id": product_id,
+        "product": created,
+        "barcode_link": barcode_link,
+        "stock_added": bool(body.add_stock),
+        "stock_result": stock_result,
+        "summary": {
+            "household": household,
+            "product_id": product_id,
+            "barcode": body.barcode,
+            "stock_added": bool(body.add_stock),
+            "quantity": body.quantity if body.add_stock else None,
+            "best_before_date": body.best_before_date,
+            "price": body.price,
+        },
     }
 
 
@@ -1792,9 +2068,6 @@ async def barcode_scan(
 
 @app.get("/", include_in_schema=False)
 async def root() -> Dict[str, Any]:
-    """
-    Simple root endpoint.
-    """
     return {
         "message": "ISAC brain is running",
         "llm_provider": JARVIS_LLM_PROVIDER,
@@ -1804,9 +2077,6 @@ async def root() -> Dict[str, Any]:
 
 @app.post("/ask", response_model=AskResponse, dependencies=[Depends(require_api_key)])
 async def ask_jarvis(body: AskRequest, request: Request) -> AskResponse:
-    """
-    Main endpoint where the UI sends user messages to be answered by the LLM.
-    """
     system_prompt = body.system_prompt or (
         "You are ISAC, a helpful assistant running inside a user's homelab. "
         "Be concise, clear, and practical. When the user references devices or "
@@ -1844,9 +2114,6 @@ async def ask_jarvis(body: AskRequest, request: Request) -> AskResponse:
 
 @app.get("/history", dependencies=[Depends(require_api_key)])
 def history(limit: int = 20) -> Dict[str, Any]:
-    """
-    Return the most recent conversation entries (user question + Jarvis reply).
-    """
     items = fetch_recent_conversations(limit=limit)
     return {"count": len(items), "items": items}
 
