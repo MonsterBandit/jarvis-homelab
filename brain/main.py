@@ -756,6 +756,90 @@ async def ha_calendar_get_events(
     return []
 
 
+def _coerce_ha_time_to_iso(
+    value: Any,
+    *,
+    tz: ZoneInfo,
+) -> Tuple[Optional[str], bool]:
+    """
+    Home Assistant calendar time fields can be:
+      - {"dateTime": "..."}  (timed)
+      - {"date": "YYYY-MM-DD"} (all-day)
+      - "..." (string ISO-ish)
+
+    Returns: (iso_string, is_all_day)
+    - For all-day events, we normalize to midnight server tz (YYYY-MM-DDT00:00:00±HH:MM)
+    - For timed events, we preserve the datetime in server tz.
+    """
+    if value is None:
+        return (None, False)
+
+    # Dict shape: {"dateTime": "..."} or {"date": "..."}
+    if isinstance(value, dict):
+        dt_val = value.get("dateTime")
+        d_val = value.get("date")
+
+        if isinstance(d_val, str) and d_val:
+            # All-day: date only
+            try:
+                y, m, d = d_val.split("-")
+                dt = datetime(int(y), int(m), int(d), 0, 0, 0, tzinfo=tz)
+                return (dt.isoformat(), True)
+            except Exception:
+                # If parsing fails, fall through and stringify
+                return (str(d_val), True)
+
+        if isinstance(dt_val, str) and dt_val:
+            # Timed: parse ISO -> convert to server tz if possible
+            try:
+                parsed = datetime.fromisoformat(dt_val.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc).astimezone(tz)
+                else:
+                    parsed = parsed.astimezone(tz)
+                return (parsed.isoformat(), False)
+            except Exception:
+                return (dt_val, False)
+
+    # String shape: best effort
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return (None, False)
+        try:
+            parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc).astimezone(tz)
+            else:
+                parsed = parsed.astimezone(tz)
+            return (parsed.isoformat(), False)
+        except Exception:
+            # Could be a date-only string or non-ISO. Treat date-only as all-day.
+            if len(s) == 10 and s[4] == "-" and s[7] == "-":
+                try:
+                    y, m, d = s.split("-")
+                    dt = datetime(int(y), int(m), int(d), 0, 0, 0, tzinfo=tz)
+                    return (dt.isoformat(), True)
+                except Exception:
+                    return (s, True)
+            return (s, False)
+
+    # Unknown type
+    return (str(value), False)
+
+
+def _parse_iso_to_dt(iso_str: Optional[str]) -> Optional[datetime]:
+    """
+    Best effort parse for sorting. Returns timezone-aware datetime when possible.
+    """
+    if not iso_str:
+        return None
+    try:
+        return datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
 @calendar_router.get("/entities")
 async def calendar_entities(
     household: Optional[str] = Query(
@@ -789,10 +873,20 @@ async def calendar_week(
         default="home_a",
         description="home_a | home_b (default: home_a)",
     ),
+    include_raw: bool = Query(
+        default=False,
+        description="If true, include raw HA event payloads. Default false.",
+    ),
 ) -> Dict[str, Any]:
     """
     Read-only: Fetch calendar events for a Sunday-start planning week window
     using server timezone helpers (deterministic).
+
+    POLISH A:
+    - Normalizes start/end into start_iso/end_iso
+    - Normalizes all_day boolean
+    - Improves sorting by actual datetime
+    - raw payload included only if include_raw=true
     """
     hh = _normalize_calendar_household(household)
 
@@ -815,20 +909,27 @@ async def calendar_week(
             end=window_end,
         )
 
-        # Normalize minimal event shape for consistent UI consumption
         normalized_events: List[Dict[str, Any]] = []
         for ev in events:
             if not isinstance(ev, dict):
                 continue
-            normalized = {
+
+            start_iso, start_all_day = _coerce_ha_time_to_iso(ev.get("start"), tz=tz)
+            end_iso, end_all_day = _coerce_ha_time_to_iso(ev.get("end"), tz=tz)
+            all_day = bool(ev.get("all_day")) or start_all_day or end_all_day
+
+            normalized: Dict[str, Any] = {
                 "summary": ev.get("summary") or ev.get("title") or None,
-                "start": ev.get("start"),
-                "end": ev.get("end"),
                 "location": ev.get("location"),
                 "description": ev.get("description"),
-                "all_day": ev.get("all_day"),
-                "raw": ev,
+                "all_day": all_day,
+                "start_iso": start_iso,
+                "end_iso": end_iso,
             }
+
+            if include_raw:
+                normalized["raw"] = ev
+
             normalized_events.append(normalized)
 
             combined_events.append(
@@ -852,15 +953,11 @@ async def calendar_week(
             }
         )
 
-    # Sort combined events by start (string sort works for ISO-like formats; fallback stable)
-    def _sort_key(ev: Dict[str, Any]) -> str:
-        s = ev.get("start")
-        if isinstance(s, str):
-            return s
-        if isinstance(s, dict):
-            # HA sometimes returns {"dateTime": "..."} or {"date": "..."}
-            return str(s.get("dateTime") or s.get("date") or "")
-        return ""
+    def _sort_key(ev: Dict[str, Any]) -> Tuple[datetime, int, str]:
+        start_dt = _parse_iso_to_dt(ev.get("start_iso")) or datetime.max.replace(tzinfo=timezone.utc)
+        all_day_rank = 0 if bool(ev.get("all_day")) else 1
+        summary = str(ev.get("summary") or "")
+        return (start_dt, all_day_rank, summary.lower())
 
     combined_events.sort(key=_sort_key)
 
@@ -875,6 +972,7 @@ async def calendar_week(
             "end": window_end.isoformat(),
         },
         "ignored": sorted(list(CALENDAR_ENTITY_IGNORE)),
+        "include_raw": bool(include_raw),
         "calendars": {
             "count": len(per_calendar),
             "items": per_calendar,
@@ -887,6 +985,7 @@ async def calendar_week(
             "Read-only calendar awareness.",
             "No DB writes, no HA writes, no event creation.",
             "Week window is Sunday-start and derived from server time.",
+            "POLISH A: normalized start/end fields and sorting; raw optional.",
         ],
     }
 
