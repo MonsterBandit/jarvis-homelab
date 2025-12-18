@@ -4,10 +4,12 @@ import os
 import socket
 import sqlite3
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Literal
 
+import httpx
 import psutil
 from fastapi import (
     APIRouter,
@@ -81,6 +83,7 @@ def init_db() -> None:
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
     try:
         cur = conn.cursor()
 
@@ -118,7 +121,7 @@ def init_db() -> None:
             """
         )
 
-                # Recipe ingredient mappings (Phase 6.75.5)
+        # Recipe ingredient mappings (Phase 6.75.5)
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS recipe_ingredient_mapping (
@@ -144,6 +147,45 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_recipe_ing_map_norm
             ON recipe_ingredient_mapping (ingredient_norm)
+            """
+        )
+
+        # -------------------------------------------------
+        # Phase 6.9 — Calendar ownership & mapping (READ-ONLY)
+        # -------------------------------------------------
+
+        # Maps a person/owner to a household
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS calendar_owner_household (
+                owner_key TEXT PRIMARY KEY,
+                household TEXT NOT NULL CHECK (household IN ('home_a', 'home_b')),
+                display_name TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        # Maps Home Assistant calendar entities to an owner
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS calendar_entity_owner (
+                entity_id TEXT PRIMARY KEY,
+                owner_key TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                label TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (owner_key)
+                    REFERENCES calendar_owner_household (owner_key)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_calendar_entity_owner_owner
+            ON calendar_entity_owner (owner_key)
             """
         )
 
@@ -342,6 +384,226 @@ def clear_shopping_list(household: str) -> int:
         conn.close()
 
 
+# ---------------------------------------------------------
+# Phase 6.9 — Calendar DB-read helpers (READ-ONLY)
+# ---------------------------------------------------------
+
+# Hard ignore list for calendar awareness reads (LOCKED)
+# - Always ignored regardless of DB contents or HA discovery
+CALENDAR_ENTITY_IGNORE: set[str] = {
+    "calendar.kaitlyn",
+    "calendar.laila",
+    "calendar.apentalp_gmail_com",
+}
+
+
+def _normalize_calendar_household(household: Optional[str]) -> str:
+    """
+    Calendar awareness default = home_a.
+    Only valid: home_a | home_b
+    """
+    h = (household or "home_a").strip().lower()
+    if h not in {"home_a", "home_b"}:
+        raise HTTPException(
+            status_code=400,
+            detail="household must be 'home_a' or 'home_b'",
+        )
+    return h
+
+
+def get_enabled_calendar_entities_for_household(
+    household: str,
+) -> List[Dict[str, Any]]:
+    """
+    Return enabled calendar entities for a given household from DB.
+    READ-ONLY. No DB writes.
+    Excludes hard-ignored calendars.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                ceo.entity_id,
+                ceo.owner_key,
+                ceo.enabled,
+                ceo.label,
+                coh.household,
+                coh.display_name
+            FROM calendar_entity_owner ceo
+            JOIN calendar_owner_household coh
+                ON coh.owner_key = ceo.owner_key
+            WHERE coh.household = ?
+              AND ceo.enabled = 1
+            ORDER BY ceo.entity_id ASC
+            """,
+            (household,),
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    results: List[Dict[str, Any]] = []
+    for entity_id, owner_key, enabled, label, hh, display_name in rows:
+        if not entity_id:
+            continue
+        if entity_id in CALENDAR_ENTITY_IGNORE:
+            continue
+        results.append(
+            {
+                "entity_id": entity_id,
+                "owner_key": owner_key,
+                "enabled": bool(enabled),
+                "label": label,
+                "household": hh,
+                "owner_display_name": display_name,
+            }
+        )
+    return results
+
+
+# ---------------------------------------------------------
+# Phase 6.9 — Calendar planning window helpers (pure logic)
+# Server-time based, Sunday-first weeks, deterministic
+# ---------------------------------------------------------
+
+_SERVER_TZ: Optional[ZoneInfo] = None
+
+
+def get_server_timezone() -> ZoneInfo:
+    """
+    Return a ZoneInfo representing the server's local timezone.
+    Deterministic resolution order (no network, no HA, no DB):
+      1) tzinfo key from datetime.now().astimezone()
+      2) TZ environment variable if set
+      3) Fallback to America/New_York (expected for this deployment)
+    """
+    global _SERVER_TZ
+
+    if _SERVER_TZ is not None:
+        return _SERVER_TZ
+
+    # 1) Ask the OS what "local time" is, then attempt to recover a ZoneInfo key.
+    try:
+        local_tzinfo = datetime.now().astimezone().tzinfo
+        tz_key = getattr(local_tzinfo, "key", None)
+        if tz_key:
+            _SERVER_TZ = ZoneInfo(str(tz_key))
+            return _SERVER_TZ
+    except Exception:
+        pass
+
+    # 2) TZ env var (common in containers)
+    tz_env = (os.getenv("TZ") or "").strip()
+    if tz_env:
+        try:
+            _SERVER_TZ = ZoneInfo(tz_env)
+            return _SERVER_TZ
+        except Exception:
+            pass
+
+    # 3) Locked expected fallback
+    _SERVER_TZ = ZoneInfo("America/New_York")
+    return _SERVER_TZ
+
+
+def now_server(tz: Optional[ZoneInfo] = None) -> datetime:
+    """
+    Return current server-time as a timezone-aware datetime.
+    """
+    tz_final = tz or get_server_timezone()
+    return datetime.now(tz_final)
+
+
+def _ensure_server_aware(dt: datetime, tz: Optional[ZoneInfo] = None) -> datetime:
+    """
+    Normalize a datetime to server timezone.
+    - If naive: interpret as server-local time (no guessing beyond that).
+    - If aware: convert to server timezone.
+    """
+    tz_final = tz or get_server_timezone()
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=tz_final)
+    return dt.astimezone(tz_final)
+
+
+def week_start_sunday(dt: datetime, tz: Optional[ZoneInfo] = None) -> datetime:
+    """
+    Given any datetime, return the Sunday 00:00:00 of its week in server time.
+    Week definition: Sunday -> Saturday.
+    """
+    dt_local = _ensure_server_aware(dt, tz=tz)
+
+    # Python weekday(): Monday=0 ... Sunday=6
+    # We want Sunday=0 ... Saturday=6
+    days_since_sunday = (dt_local.weekday() + 1) % 7
+
+    start_date = (dt_local - timedelta(days=days_since_sunday)).date()
+    return datetime(
+        year=start_date.year,
+        month=start_date.month,
+        day=start_date.day,
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+        tzinfo=dt_local.tzinfo,
+    )
+
+
+def planning_window_week(
+    offset_weeks: int = 0,
+    anchor: Optional[datetime] = None,
+    tz: Optional[ZoneInfo] = None,
+) -> Tuple[datetime, datetime]:
+    """
+    Return a (start, end) tuple for a Sunday-first week window in server time.
+    - start: Sunday 00:00:00
+    - end: next Sunday 00:00:00 (end-exclusive)
+    offset_weeks:
+      0 = current week, 1 = next week, -1 = prior week, etc.
+    anchor:
+      If provided, the week is computed relative to that moment; otherwise uses now_server().
+    """
+    anchor_dt = anchor if anchor is not None else now_server(tz=tz)
+    start = week_start_sunday(anchor_dt, tz=tz) + timedelta(weeks=int(offset_weeks))
+    end = start + timedelta(days=7)
+    return start, end
+
+
+def planning_window_current_week(
+    anchor: Optional[datetime] = None,
+    tz: Optional[ZoneInfo] = None,
+) -> Tuple[datetime, datetime]:
+    """
+    Convenience wrapper for the current Sunday-start week in server time.
+    """
+    return planning_window_week(offset_weeks=0, anchor=anchor, tz=tz)
+
+
+def planning_window_future_week(
+    offset_weeks: int,
+    anchor: Optional[datetime] = None,
+    tz: Optional[ZoneInfo] = None,
+) -> Tuple[datetime, datetime]:
+    """
+    Convenience wrapper for future/past weeks via offset.
+    """
+    return planning_window_week(offset_weeks=offset_weeks, anchor=anchor, tz=tz)
+
+
+def planning_window_to_iso(
+    window: Tuple[datetime, datetime],
+) -> Dict[str, str]:
+    """
+    Convert a (start, end) window to ISO strings for logging/debugging/UI.
+    Pure formatting helper (no side effects).
+    """
+    start, end = window
+    return {"start": start.isoformat(), "end": end.isoformat()}
+
+
 # ----------------------------
 # LLM client initialization
 # ----------------------------
@@ -418,6 +680,215 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
 
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+# ---------------------------------------------------------
+# Phase 6.9 — Calendar awareness router (READ-ONLY)
+# Server-time based windows, Sunday-first weeks
+# No HA writes, no DB writes, no creation
+# ---------------------------------------------------------
+
+calendar_router = APIRouter(
+    prefix="/calendar",
+    tags=["calendar"],
+    dependencies=[Depends(require_api_key)],
+)
+
+
+def ensure_ha_configured_for_calendar_reads() -> None:
+    """
+    Calendar awareness requires HA base URL + token to do HA REST calendar reads.
+    (This is read-only.)
+    """
+    if not HOMEASSISTANT_BASE_URL or not HOMEASSISTANT_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Home Assistant not configured (HOMEASSISTANT_BASE_URL / HOMEASSISTANT_TOKEN missing).",
+        )
+
+
+async def ha_calendar_get_events(
+    entity_id: str,
+    start: datetime,
+    end: datetime,
+) -> List[Dict[str, Any]]:
+    """
+    Read-only Home Assistant calendar events via REST:
+      GET /api/calendars/{entity_id}?start=...&end=...
+    """
+    ensure_ha_configured_for_calendar_reads()
+
+    base = HOMEASSISTANT_BASE_URL.rstrip("/")
+    url = f"{base}/api/calendars/{entity_id}"
+
+    headers = {
+        "Authorization": f"Bearer {HOMEASSISTANT_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    # HA accepts RFC3339/ISO strings; we pass timezone-aware ISO.
+    params = {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+    }
+
+    timeout = httpx.Timeout(20.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.get(url, headers=headers, params=params)
+
+    if resp.status_code == 404:
+        # Entity missing or calendar endpoint not available for this entity
+        return []
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "Home Assistant calendar read failed",
+                "entity_id": entity_id,
+                "status_code": resp.status_code,
+                "body": resp.text,
+            },
+        )
+
+    payload = resp.json()
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+@calendar_router.get("/entities")
+async def calendar_entities(
+    household: Optional[str] = Query(
+        default="home_a",
+        description="home_a | home_b (default: home_a)",
+    ),
+) -> Dict[str, Any]:
+    """
+    Read-only list of enabled calendar entities for the household.
+    DB-read only. Hard-ignores kaitlyn/laila/apentalp.
+    """
+    hh = _normalize_calendar_household(household)
+    entities = get_enabled_calendar_entities_for_household(hh)
+
+    return {
+        "status": "ok",
+        "household": hh,
+        "ignored": sorted(list(CALENDAR_ENTITY_IGNORE)),
+        "count": len(entities),
+        "entities": entities,
+    }
+
+
+@calendar_router.get("/week")
+async def calendar_week(
+    offset_weeks: int = Query(
+        default=0,
+        description="0=current week (Sunday-start), 1=next week, -1=previous week, etc.",
+    ),
+    household: Optional[str] = Query(
+        default="home_a",
+        description="home_a | home_b (default: home_a)",
+    ),
+) -> Dict[str, Any]:
+    """
+    Read-only: Fetch calendar events for a Sunday-start planning week window
+    using server timezone helpers (deterministic).
+    """
+    hh = _normalize_calendar_household(household)
+
+    tz = get_server_timezone()
+    window_start, window_end = planning_window_week(offset_weeks=offset_weeks, tz=tz)
+
+    calendars = get_enabled_calendar_entities_for_household(hh)
+
+    per_calendar: List[Dict[str, Any]] = []
+    combined_events: List[Dict[str, Any]] = []
+
+    for cal in calendars:
+        entity_id = cal.get("entity_id")
+        if not entity_id or entity_id in CALENDAR_ENTITY_IGNORE:
+            continue
+
+        events = await ha_calendar_get_events(
+            entity_id=entity_id,
+            start=window_start,
+            end=window_end,
+        )
+
+        # Normalize minimal event shape for consistent UI consumption
+        normalized_events: List[Dict[str, Any]] = []
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            normalized = {
+                "summary": ev.get("summary") or ev.get("title") or None,
+                "start": ev.get("start"),
+                "end": ev.get("end"),
+                "location": ev.get("location"),
+                "description": ev.get("description"),
+                "all_day": ev.get("all_day"),
+                "raw": ev,
+            }
+            normalized_events.append(normalized)
+
+            combined_events.append(
+                {
+                    "entity_id": entity_id,
+                    "owner_key": cal.get("owner_key"),
+                    "owner_display_name": cal.get("owner_display_name"),
+                    "label": cal.get("label"),
+                    **normalized,
+                }
+            )
+
+        per_calendar.append(
+            {
+                "entity_id": entity_id,
+                "owner_key": cal.get("owner_key"),
+                "owner_display_name": cal.get("owner_display_name"),
+                "label": cal.get("label"),
+                "event_count": len(normalized_events),
+                "events": normalized_events,
+            }
+        )
+
+    # Sort combined events by start (string sort works for ISO-like formats; fallback stable)
+    def _sort_key(ev: Dict[str, Any]) -> str:
+        s = ev.get("start")
+        if isinstance(s, str):
+            return s
+        if isinstance(s, dict):
+            # HA sometimes returns {"dateTime": "..."} or {"date": "..."}
+            return str(s.get("dateTime") or s.get("date") or "")
+        return ""
+
+    combined_events.sort(key=_sort_key)
+
+    return {
+        "status": "ok",
+        "household": hh,
+        "offset_weeks": int(offset_weeks),
+        "timezone": getattr(tz, "key", str(tz)),
+        "first_day_of_week": "sunday",
+        "window": {
+            "start": window_start.isoformat(),
+            "end": window_end.isoformat(),
+        },
+        "ignored": sorted(list(CALENDAR_ENTITY_IGNORE)),
+        "calendars": {
+            "count": len(per_calendar),
+            "items": per_calendar,
+        },
+        "events": {
+            "count": len(combined_events),
+            "items": combined_events,
+        },
+        "notes": [
+            "Read-only calendar awareness.",
+            "No DB writes, no HA writes, no event creation.",
+            "Week window is Sunday-start and derived from server time.",
+        ],
+    }
 
 
 # ----------------------------
@@ -2665,6 +3136,7 @@ async def model_client_error_handler(
 
 app.include_router(health_router)
 app.include_router(ha_router)
+app.include_router(calendar_router)
 app.include_router(grocy_router)
 app.include_router(mealplanner_router)
 app.include_router(barcode_router)
@@ -2673,4 +3145,3 @@ app.include_router(ingredient_parser_router)
 app.include_router(recipe_matcher_router)
 app.include_router(recipe_analyzer_router)
 app.include_router(recipe_mappings_router)
-
