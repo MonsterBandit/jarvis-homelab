@@ -42,6 +42,13 @@ from services.openfoodfacts import (
     extract_suggestion_from_off_payload,
 )
 
+from services.recipes import router as recipes_router  # Phase 6.75.1
+from services.ingredient_parser import router as ingredient_parser_router  # Phase 6.75.2
+from services.recipe_matcher import router as recipe_matcher_router  # Phase 6.75.3
+from services.recipe_analyzer import router as recipe_analyzer_router  # Phase 6.75.4
+from services.recipe_mappings import router as recipe_mappings_router  # Phase 6.75.5
+
+
 # ----------------------------
 # Environment & configuration
 # ----------------------------
@@ -108,6 +115,35 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_shopping_list_household_completed
             ON shopping_list (household, completed)
+            """
+        )
+
+                # Recipe ingredient mappings (Phase 6.75.5)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recipe_ingredient_mapping (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                household TEXT, -- NULL = global mapping
+                ingredient_norm TEXT NOT NULL,
+                ingredient_display TEXT NOT NULL,
+                product_id INTEGER NOT NULL,
+                product_name TEXT,
+                notes TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_recipe_ing_map_household_norm
+            ON recipe_ingredient_mapping (household, ingredient_norm)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_recipe_ing_map_norm
+            ON recipe_ingredient_mapping (ingredient_norm)
             """
         )
 
@@ -1095,6 +1131,158 @@ async def grocy_inspect_barcode(
     )
 
 
+# ----------------------------
+# Phase 6.45 — Step 4: Confirm + Create + Link + Optionally Add Stock (Explicit approval only)
+# ----------------------------
+    
+class GrocyConfirmCreateAndOptionallyStockRequest(BaseModel):
+    household: Literal["home_a", "home_b"] = Field(..., description="Target household (home_a | home_b)")
+    barcode: str = Field(..., min_length=1, description="Barcode / UPC / EAN string")
+    name: str = Field(..., min_length=1, description="Final authoritative product name")
+    location_id: int = Field(..., ge=1, description="Grocy location_id to assign to the product")
+    qu_id_purchase: int = Field(..., ge=1, description="Grocy purchase unit ID (required)")
+    qu_id_stock: int = Field(..., ge=1, description="Grocy stock unit ID (required)")
+    
+    # Optional stock add (explicit)
+    add_stock: bool = Field(False, description="If true, add stock after create+link")
+    quantity: Optional[float] = Field(default=None, gt=0, description="Quantity to add (required if add_stock=true)")
+    best_before_date: Optional[str] = Field(default=None, description="YYYY-MM-DD (optional)")
+    purchased_date: Optional[str] = Field(default=None, description="YYYY-MM-DD (optional)")
+    price: Optional[float] = Field(default=None, ge=0, description="Optional price (>= 0)")
+    
+    # Advisory only (not used for behavior yet)
+    brand: Optional[str] = None
+    category: Optional[str] = None
+    
+    
+@grocy_router.post(
+    "/confirm-create-and-optionally-stock",
+    summary="Confirm-create product from inspection, link barcode, and optionally add stock (explicit only).",
+)
+async def grocy_confirm_create_and_optionally_stock(
+    body: GrocyConfirmCreateAndOptionallyStockRequest,
+    client: Optional[GrocyClient] = Depends(get_grocy_client),
+) -> Dict[str, Any]:
+    """
+    Phase 6.45 Step 4 (LOCKED):
+    - Requires explicit final authoritative fields
+    - Creates product in Grocy
+    - Links barcode in Grocy
+    - Optionally adds stock ONLY if add_stock=true and quantity provided
+    - NO shopping list changes
+    - NO inference
+    """
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Grocy client not configured; confirm-create unavailable.",
+        )
+    
+    household = body.household.strip().lower()
+    if household not in {"home_a", "home_b"}:
+        raise HTTPException(status_code=400, detail="household must be 'home_a' or 'home_b'")
+    
+    barcode = body.barcode.strip()
+    if not barcode:
+        raise HTTPException(status_code=400, detail="barcode must not be empty")
+    
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name must not be empty")
+    
+    if body.add_stock and body.quantity is None:
+        raise HTTPException(status_code=400, detail="quantity is required when add_stock=true")
+    
+    # 1) Create product
+    try:
+        created = await client.create_product(
+            household=household,
+            name=name,
+            location_id=body.location_id,
+            qu_id_purchase=body.qu_id_purchase,
+            qu_id_stock=body.qu_id_stock,
+        )
+    except GrocyError as exc:
+        raise HTTPException(status_code=502, detail=f"Error creating product in Grocy: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Unexpected error creating product: {exc}") from exc
+    
+    # Extract product_id robustly
+    product_id: Optional[int] = None
+    if isinstance(created, dict):
+        pid = (
+            created.get("product_id")
+            or created.get("id")
+            or created.get("created_object_id")
+            or (created.get("product") or {}).get("id")
+        )
+        if pid is not None:
+            try:
+                product_id = int(pid)
+            except (TypeError, ValueError):
+                product_id = None
+    
+    if product_id is None:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "Could not determine product_id", "created": created},
+        )
+    
+    # 2) Link barcode (explicit canonical method)
+    try:
+        barcode_link = await client.link_barcode_to_product(
+            household=household,
+            barcode=barcode,
+            product_id=product_id,
+        )
+    except GrocyError as exc:
+        raise HTTPException(status_code=502, detail=f"Error linking barcode in Grocy: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Unexpected error linking barcode: {exc}") from exc
+    
+    stock_result: Optional[Dict[str, Any]] = None
+    
+    # 3) Optional stock add (ONLY if explicitly requested)
+    if body.add_stock:
+        stock_payload: Dict[str, Any] = {"amount": float(body.quantity)}  # Grocy expects "amount"
+    
+        # Optional fields if provided
+        if body.best_before_date:
+            stock_payload["best_before_date"] = body.best_before_date
+        if body.purchased_date:
+            stock_payload["purchased_date"] = body.purchased_date
+        if body.price is not None:
+            stock_payload["price"] = float(body.price)
+    
+        try:
+            stock_result = await client.add_stock(
+                household=household,
+                product_id=product_id,
+                payload=stock_payload,
+            )
+        except GrocyError as exc:
+            raise HTTPException(status_code=502, detail=f"Error adding stock in Grocy: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"Unexpected error adding stock: {exc}") from exc
+    
+    return {
+        "status": "ok",
+        "household": household,
+        "barcode": barcode,
+        "product_id": product_id,
+        "product": created,
+        "barcode_link": barcode_link,
+        "stock_added": bool(body.add_stock),
+        "stock_result": stock_result,
+        "advisory_metadata": {"brand": body.brand, "category": body.category},
+        "notes": [
+            "Phase 6.45 Step 4: explicit confirm-create + optional stock only",
+            "No shopping list changes",
+            "No inference",
+        ],
+    }
+    
+
 @grocy_router.get("/health")
 async def grocy_health(
     client: Optional[GrocyClient] = Depends(get_grocy_client),
@@ -1212,6 +1400,75 @@ async def grocy_locations(
     except GrocyError as exc:
         return {"status": "error", "error": str(exc)}
 
+# ----------------------------
+# NEW: Grocy location creation (explicit, Gate A)
+# ----------------------------
+
+class GrocyCreateLocationRequest(BaseModel):
+    name: str = Field(..., min_length=1, description="Location name")
+    description: Optional[str] = None
+    is_freezer: int = Field(0, description="1 if freezer, 0 otherwise")
+
+
+@grocy_router.post("/locations/{household}")
+async def grocy_create_location(
+    household: str,
+    body: GrocyCreateLocationRequest,
+    client: Optional[GrocyClient] = Depends(get_grocy_client),
+) -> Dict[str, Any]:
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Grocy client not configured; create location unavailable.",
+        )
+
+    hh = (household or "").strip().lower()
+    if hh not in {"home_a", "home_b"}:
+        raise HTTPException(
+            status_code=400,
+            detail="household must be 'home_a' or 'home_b'",
+        )
+
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name must not be empty")
+
+    payload = {
+        "name": name,
+        "description": body.description,
+        "is_freezer": 1 if body.is_freezer else 0,
+    }
+
+    try:
+        created = await _acall_first_existing(
+            client,
+            [
+                "create_location",
+                "create_grocy_location",
+                "add_location",
+                "create_location_for_household",
+            ],
+            household=hh,
+            payload=payload,
+        )
+    except HTTPException:
+        raise
+    except GrocyError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error creating location in Grocy: {exc}",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error creating location: {exc}",
+        ) from exc
+
+    return {
+        "status": "ok",
+        "household": hh,
+        "location": created,
+    }
 
 # ----------------------------
 # NEW: Quantity Units endpoint (Phase 6.4 Step 4)
@@ -2411,3 +2668,9 @@ app.include_router(ha_router)
 app.include_router(grocy_router)
 app.include_router(mealplanner_router)
 app.include_router(barcode_router)
+app.include_router(recipes_router)
+app.include_router(ingredient_parser_router)
+app.include_router(recipe_matcher_router)
+app.include_router(recipe_analyzer_router)
+app.include_router(recipe_mappings_router)
+
