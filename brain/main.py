@@ -570,6 +570,17 @@ def planning_window_week(
     start = week_start_sunday(anchor_dt, tz=tz) + timedelta(weeks=int(offset_weeks))
     end = start + timedelta(days=7)
     return start, end
+    
+
+def planning_window_today(tz: ZoneInfo) -> Tuple[datetime, datetime]:
+    """
+    Return server-time 'today' window:
+    [today 00:00:00 → tomorrow 00:00:00)
+    """
+    now = datetime.now(tz)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    return start, end   
 
 
 def planning_window_current_week(
@@ -986,6 +997,97 @@ async def calendar_week(
             "No DB writes, no HA writes, no event creation.",
             "Week window is Sunday-start and derived from server time.",
             "POLISH A: normalized start/end fields and sorting; raw optional.",
+        ],
+    }
+
+
+@calendar_router.get("/today")
+async def calendar_today(
+    household: Optional[str] = Query(
+        default="home_a",
+        description="home_a | home_b (default: home_a)",
+    ),
+    include_raw: bool = Query(
+        default=False,
+        description="If true, include raw HA event payloads. Default false.",
+    ),
+) -> Dict[str, Any]:
+    """
+    Read-only: Fetch calendar events for 'today' using server timezone.
+    Same normalization and ignore rules as /calendar/week.
+    """
+    hh = _normalize_calendar_household(household)
+
+    tz = get_server_timezone()
+    window_start, window_end = planning_window_today(tz=tz)
+
+    calendars = get_enabled_calendar_entities_for_household(hh)
+
+    combined_events: List[Dict[str, Any]] = []
+
+    for cal in calendars:
+        entity_id = cal.get("entity_id")
+        if not entity_id or entity_id in CALENDAR_ENTITY_IGNORE:
+            continue
+
+        events = await ha_calendar_get_events(
+            entity_id=entity_id,
+            start=window_start,
+            end=window_end,
+        )
+
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+
+            start_iso, start_all_day = _coerce_ha_time_to_iso(ev.get("start"), tz=tz)
+            end_iso, end_all_day = _coerce_ha_time_to_iso(ev.get("end"), tz=tz)
+            all_day = bool(ev.get("all_day")) or start_all_day or end_all_day
+
+            normalized: Dict[str, Any] = {
+                "entity_id": entity_id,
+                "owner_key": cal.get("owner_key"),
+                "owner_display_name": cal.get("owner_display_name"),
+                "label": cal.get("label"),
+                "summary": ev.get("summary") or ev.get("title") or None,
+                "location": ev.get("location"),
+                "description": ev.get("description"),
+                "all_day": all_day,
+                "start_iso": start_iso,
+                "end_iso": end_iso,
+            }
+
+            if include_raw:
+                normalized["raw"] = ev
+
+            combined_events.append(normalized)
+
+    def _sort_key(ev: Dict[str, Any]) -> Tuple[datetime, int, str]:
+        start_dt = _parse_iso_to_dt(ev.get("start_iso")) or datetime.max.replace(tzinfo=timezone.utc)
+        all_day_rank = 0 if bool(ev.get("all_day")) else 1
+        summary = str(ev.get("summary") or "")
+        return (start_dt, all_day_rank, summary.lower())
+
+    combined_events.sort(key=_sort_key)
+
+    return {
+        "status": "ok",
+        "household": hh,
+        "timezone": getattr(tz, "key", str(tz)),
+        "window": {
+            "start": window_start.isoformat(),
+            "end": window_end.isoformat(),
+        },
+        "ignored": sorted(list(CALENDAR_ENTITY_IGNORE)),
+        "include_raw": bool(include_raw),
+        "events": {
+            "count": len(combined_events),
+            "items": combined_events,
+        },
+        "notes": [
+            "Read-only calendar awareness.",
+            "Server-time 'today' window.",
+            "No DB writes, no HA writes, no event creation.",
         ],
     }
 
