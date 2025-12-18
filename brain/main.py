@@ -35,6 +35,13 @@ from services.barcodebuddy import (
     create_barcodebuddy_client,
 )
 
+# NEW: OpenFoodFacts (Phase 6.45 Step 2)
+from services.openfoodfacts import (
+    OpenFoodFactsError,
+    create_openfoodfacts_client,
+    extract_suggestion_from_off_payload,
+)
+
 # ----------------------------
 # Environment & configuration
 # ----------------------------
@@ -870,6 +877,10 @@ class GrocyBarcodeInspectResponse(BaseModel):
     household: Literal["home_a", "home_b"]
     found_in_grocy: bool
     product: Optional[Dict[str, Any]] = None
+
+    # NEW: external lookup payload (minimal/debuggable)
+    external: Optional[Dict[str, Any]] = None
+
     suggestion: ProductSuggestion
     next_actions: List[str] = Field(default_factory=list)
     reasons: List[str] = Field(default_factory=list)
@@ -931,6 +942,26 @@ async def _try_grocy_lookup_by_barcode(
     return (True, {"result": result}, reasons)
 
 
+def _build_external_minimal_payload(source: str, off_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return a minimal external payload suitable for debugging/UI without overwhelming.
+    """
+    product = off_payload.get("product") if isinstance(off_payload.get("product"), dict) else {}
+    if not isinstance(product, dict):
+        product = {}
+
+    return {
+        "source": source,
+        "status": off_payload.get("status"),
+        "code": off_payload.get("code"),
+        "product_name": product.get("product_name") or product.get("product_name_en"),
+        "brands": product.get("brands"),
+        "categories": product.get("categories"),
+        "image_url": product.get("image_url") or product.get("image_front_url"),
+        "url": product.get("url"),
+    }
+
+
 @grocy_router.get(
     "/inspect-barcode",
     response_model=GrocyBarcodeInspectResponse,
@@ -944,27 +975,28 @@ async def grocy_inspect_barcode(
     ),
     client: Optional[GrocyClient] = Depends(get_grocy_client),
 ) -> GrocyBarcodeInspectResponse:
+    hh = _require_household_write_scope(household)
+
+    code = (barcode or "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="barcode must not be empty")
+
     if client is None:
         # Return disabled as a normal response_model payload with low confidence.
         # This keeps callers from crashing on 503s when services are intentionally off.
-        hh = _require_household_write_scope(household)
         return GrocyBarcodeInspectResponse(
-            barcode=barcode,
+            barcode=code,
             household=hh,  # type: ignore[arg-type]
             found_in_grocy=False,
             product=None,
+            external=None,
             suggestion=ProductSuggestion(
                 confidence="low",
                 notes="Grocy client not configured; cannot inspect barcode.",
             ),
-            next_actions=["configure_grocy", "user_confirmation_required"],
+            next_actions=["configure_grocy", "external_lookup", "user_confirmation_required"],
             reasons=["grocy_disabled"],
         )
-
-    hh = _require_household_write_scope(household)
-    code = (barcode or "").strip()
-    if not code:
-        raise HTTPException(status_code=400, detail="barcode must not be empty")
 
     found, product, reasons = await _try_grocy_lookup_by_barcode(
         client=client,
@@ -992,30 +1024,71 @@ async def grocy_inspect_barcode(
             household=hh,  # type: ignore[arg-type]
             found_in_grocy=True,
             product=product,
+            external=None,
             suggestion=suggestion,
             next_actions=["no_action_needed", "user_confirmation_required"],
             reasons=reasons,
         )
 
-    # Not found (or lookup unavailable): return a sparse suggestion object.
-    suggestion = ProductSuggestion(
-        confidence="low",
-        notes="No existing product found in Grocy for this barcode.",
-    )
+    # ---------- NEW: External lookup fallback (OpenFoodFacts) ----------
+    external_payload: Optional[Dict[str, Any]] = None
+    external_suggestion: Dict[str, Optional[str]] = {"name": None, "brand": None, "category": None}
 
-    next_actions = ["external_lookup", "user_confirmation_required"]
+    try:
+        off_client = create_openfoodfacts_client()
+        off_raw = off_client.lookup_barcode(code)
+        external_payload = _build_external_minimal_payload("openfoodfacts", off_raw)
+
+        # OFF status 1 indicates product exists
+        if isinstance(off_raw, dict) and off_raw.get("status") == 1:
+            external_suggestion = extract_suggestion_from_off_payload(off_raw)
+            reasons.append("found_in_openfoodfacts")
+        else:
+            reasons.append("not_found_in_openfoodfacts")
+
+    except OpenFoodFactsError as exc:
+        reasons.append(f"openfoodfacts_error: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        reasons.append(f"openfoodfacts_error: {exc}")
+
+    # Build the suggestion object from external lookup, if any.
+    name = external_suggestion.get("name")
+    brand = external_suggestion.get("brand")
+    category = external_suggestion.get("category")
+
+    if name or brand or category:
+        suggestion = ProductSuggestion(
+            name=name,
+            brand=brand,
+            category=category,
+            confidence="medium",
+            notes="Not found in Grocy. External lookup suggests this product. Approval required before any creation.",
+        )
+        next_actions = ["user_confirmation_required"]
+    else:
+        # Not found (or lookup unavailable): return a sparse suggestion object.
+        suggestion = ProductSuggestion(
+            confidence="low",
+            notes="No existing product found in Grocy for this barcode.",
+        )
+        next_actions = ["external_lookup", "user_confirmation_required"]
+
     if "grocy_client_has_no_barcode_lookup_method" in reasons:
-        next_actions = ["add_grocy_barcode_lookup", "external_lookup", "user_confirmation_required"]
+        # Preserve the Step 1 signal, but now we *also* tried external lookup.
         suggestion.notes = (
             "Grocy client does not yet support barcode lookup; "
-            "Phase 6.45 will add external lookup and (optionally) Grocy barcode mapping."
+            "external lookup was attempted. Approval required before any creation."
         )
+        # Make it explicit we still need Grocy mapping support later.
+        if "add_grocy_barcode_lookup" not in next_actions:
+            next_actions = ["add_grocy_barcode_lookup", "user_confirmation_required"]
 
     return GrocyBarcodeInspectResponse(
         barcode=code,
         household=hh,  # type: ignore[arg-type]
         found_in_grocy=False,
         product=None,
+        external=external_payload,
         suggestion=suggestion,
         next_actions=next_actions,
         reasons=reasons,
@@ -1515,6 +1588,7 @@ async def jarvis_shopping_list_clear(
 # Meal planner router & endpoints (Phase 6.5)
 # ---------------------------------------------------------
 
+# (UNCHANGED remainder of file)
 
 class MealPlanPreferences(BaseModel):
     max_meals: int = 7
