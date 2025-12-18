@@ -6,7 +6,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
 import psutil
 from fastapi import (
@@ -479,6 +479,25 @@ def _require_household_query(household: Optional[str]) -> str:
     return h
 
 
+def _require_household_write_scope(household: Optional[str]) -> str:
+    """
+    For operations that must be household-specific (no 'all' allowed).
+    Phase 6.45 reasoning endpoints also use this to prevent ambiguity.
+    """
+    if household is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Query parameter 'household' is required: home_a | home_b",
+        )
+    h = (household or "").strip().lower()
+    if h not in {"home_a", "home_b"}:
+        raise HTTPException(
+            status_code=400,
+            detail="household must be 'home_a' or 'home_b'",
+        )
+    return h
+
+
 # ---------------------------------------------------------
 # Safe async method resolution (for Grocy + BarcodeBuddy)
 # ---------------------------------------------------------
@@ -825,6 +844,182 @@ async def get_grocy_client() -> Optional[GrocyClient]:
     except GrocyError:
         return None
     return client
+
+
+# ----------------------------
+# Phase 6.45 — Scan-Driven Product Knowledge (Read-only)
+# ----------------------------
+
+class ProductSuggestion(BaseModel):
+    """
+    A sparse suggestion object that can be progressively enriched over time.
+    v1 starts mostly-empty; later phases populate from OpenFoodFacts / learned mappings.
+    """
+    name: Optional[str] = None
+    brand: Optional[str] = None
+    category: Optional[str] = None
+    location_id: Optional[int] = None
+    qu_id_purchase: Optional[int] = None
+    qu_id_stock: Optional[int] = None
+    confidence: Literal["low", "medium", "high"] = "low"
+    notes: Optional[str] = None
+
+
+class GrocyBarcodeInspectResponse(BaseModel):
+    barcode: str
+    household: Literal["home_a", "home_b"]
+    found_in_grocy: bool
+    product: Optional[Dict[str, Any]] = None
+    suggestion: ProductSuggestion
+    next_actions: List[str] = Field(default_factory=list)
+    reasons: List[str] = Field(default_factory=list)
+
+
+async def _try_grocy_lookup_by_barcode(
+    client: GrocyClient,
+    household: str,
+    barcode: str,
+) -> Tuple[bool, Optional[Dict[str, Any]], List[str]]:
+    """
+    Attempt to look up a barcode in Grocy using whichever method the GrocyClient exposes.
+    This keeps main.py stable even as GrocyClient evolves.
+    """
+    tried_methods = [
+        "get_product_by_barcode",
+        "get_product_for_barcode",
+        "lookup_barcode",
+        "barcode_lookup",
+        "get_barcode_product",
+        "get_product_from_barcode",
+        "get_product_by_ean",
+        "get_product_by_upc",
+    ]
+
+    reasons: List[str] = []
+    fn = None
+    for name in tried_methods:
+        candidate = getattr(client, name, None)
+        if callable(candidate):
+            fn = candidate
+            break
+
+    if fn is None:
+        reasons.append("grocy_client_has_no_barcode_lookup_method")
+        return (False, None, reasons)
+
+    try:
+        result = await fn(household=household, barcode=barcode)  # type: ignore[misc]
+    except TypeError:
+        # Some implementations might use a different signature; try with minimal args.
+        try:
+            result = await fn(barcode=barcode)  # type: ignore[misc]
+        except Exception as exc:  # noqa: BLE001
+            reasons.append(f"grocy_barcode_lookup_error: {exc}")
+            return (False, None, reasons)
+    except Exception as exc:  # noqa: BLE001
+        reasons.append(f"grocy_barcode_lookup_error: {exc}")
+        return (False, None, reasons)
+
+    if result is None:
+        reasons.append("barcode_not_found_in_grocy")
+        return (False, None, reasons)
+
+    if isinstance(result, dict):
+        return (True, result, reasons)
+
+    # If the client returns a list or other shape, wrap it safely.
+    return (True, {"result": result}, reasons)
+
+
+@grocy_router.get(
+    "/inspect-barcode",
+    response_model=GrocyBarcodeInspectResponse,
+    summary="Inspect a barcode (read-only) and return a suggestion object. No writes.",
+)
+async def grocy_inspect_barcode(
+    barcode: str = Query(..., min_length=1, description="Barcode / UPC / EAN string"),
+    household: Optional[str] = Query(
+        default=None,
+        description="REQUIRED. home_a | home_b (no 'all' allowed for scan reasoning).",
+    ),
+    client: Optional[GrocyClient] = Depends(get_grocy_client),
+) -> GrocyBarcodeInspectResponse:
+    if client is None:
+        # Return disabled as a normal response_model payload with low confidence.
+        # This keeps callers from crashing on 503s when services are intentionally off.
+        hh = _require_household_write_scope(household)
+        return GrocyBarcodeInspectResponse(
+            barcode=barcode,
+            household=hh,  # type: ignore[arg-type]
+            found_in_grocy=False,
+            product=None,
+            suggestion=ProductSuggestion(
+                confidence="low",
+                notes="Grocy client not configured; cannot inspect barcode.",
+            ),
+            next_actions=["configure_grocy", "user_confirmation_required"],
+            reasons=["grocy_disabled"],
+        )
+
+    hh = _require_household_write_scope(household)
+    code = (barcode or "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="barcode must not be empty")
+
+    found, product, reasons = await _try_grocy_lookup_by_barcode(
+        client=client,
+        household=hh,
+        barcode=code,
+    )
+
+    if found and product:
+        # Minimal inference: if Grocy provides a name, surface it as high confidence.
+        name = None
+        for key in ("name", "product_name", "product", "title"):
+            val = product.get(key) if isinstance(product, dict) else None
+            if val:
+                name = str(val)
+                break
+
+        suggestion = ProductSuggestion(
+            name=name,
+            confidence="high" if name else "medium",
+            notes="Found existing product in Grocy for this barcode.",
+        )
+
+        return GrocyBarcodeInspectResponse(
+            barcode=code,
+            household=hh,  # type: ignore[arg-type]
+            found_in_grocy=True,
+            product=product,
+            suggestion=suggestion,
+            next_actions=["no_action_needed", "user_confirmation_required"],
+            reasons=reasons,
+        )
+
+    # Not found (or lookup unavailable): return a sparse suggestion object.
+    suggestion = ProductSuggestion(
+        confidence="low",
+        notes="No existing product found in Grocy for this barcode.",
+    )
+
+    next_actions = ["external_lookup", "user_confirmation_required"]
+    if "grocy_client_has_no_barcode_lookup_method" in reasons:
+        next_actions = ["add_grocy_barcode_lookup", "external_lookup", "user_confirmation_required"]
+        suggestion.notes = (
+            "Grocy client does not yet support barcode lookup; "
+            "Phase 6.45 will add external lookup and (optionally) Grocy barcode mapping."
+        )
+
+    return GrocyBarcodeInspectResponse(
+        barcode=code,
+        household=hh,  # type: ignore[arg-type]
+        found_in_grocy=False,
+        product=None,
+        suggestion=suggestion,
+        next_actions=next_actions,
+        reasons=reasons,
+    )
 
 
 @grocy_router.get("/health")
