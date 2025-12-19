@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,11 +20,12 @@ class HomeAssistantConfig:
 
 class HomeAssistantClient:
     """
-    Minimal synchronous client for Home Assistant's HTTP API.
+    Home Assistant HTTP API client.
 
-    We started with a simple health check and have been extending this
-    with methods for entities, states, and service calls.
-    Phase 5.6 adds better error handling and timeouts.
+    NOTE ON ASYNC:
+    Your FastAPI routes use `await client.get_states()` and `await client.get_config()`.
+    This client uses `requests` internally (sync), so we expose async wrappers that run
+    sync methods in a thread via `asyncio.to_thread`.
     """
 
     def __init__(self, config: HomeAssistantConfig) -> None:
@@ -66,42 +68,31 @@ class HomeAssistantClient:
                 f"{self.config.timeout} seconds"
             ) from exc
         except requests.RequestException as exc:  # noqa: BLE001
-            raise RuntimeError(
-                f"Error communicating with Home Assistant at {url}: {exc}"
-            ) from exc
+            raise RuntimeError(f"Error communicating with Home Assistant at {url}: {exc}") from exc
 
         try:
             resp.raise_for_status()
         except requests.HTTPError as exc:  # noqa: BLE001
-            # Include a small slice of the response body for diagnostics
             body_snippet = resp.text[:500]
             raise RuntimeError(
-                f"Home Assistant returned HTTP {resp.status_code} for {url}: "
-                f"{body_snippet}"
+                f"Home Assistant returned HTTP {resp.status_code} for {url}: {body_snippet}"
             ) from exc
 
         return resp
 
+    # --------------------------
+    # Sync methods (requests)
+    # --------------------------
+
     def health(self) -> Tuple[bool, Dict[str, Any]]:
         """
         Call HA /api/ endpoint to verify connectivity.
-
-        Returns:
-            (ok, details)
-
-            ok:
-                True if HA responds with 200 and a JSON body containing "message".
-            details:
-                dict with status_code, body, and/or error info.
         """
         url = self._build_url("/")
         try:
             resp = self._session.get(url, timeout=self.config.timeout)
         except Exception as exc:  # noqa: BLE001
-            return False, {
-                "error": str(exc),
-                "url": url,
-            }
+            return False, {"error": str(exc), "url": url}
 
         try:
             data: Any = resp.json()
@@ -110,43 +101,50 @@ class HomeAssistantClient:
 
         ok = resp.status_code == 200 and isinstance(data, dict) and "message" in data
 
-        return ok, {
-            "status_code": resp.status_code,
-            "body": data,
-            "url": url,
-        }
+        return ok, {"status_code": resp.status_code, "body": data, "url": url}
 
-    # ==========================
-    # States
-    # ==========================
+    def get_config_sync(self) -> Dict[str, Any]:
+        """
+        Return Home Assistant instance config (`GET /api/config`).
+        """
+        resp = self._request("GET", "/config")
+        data: Any = resp.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("Unexpected Home Assistant /api/config response shape")
+        return data
 
-    def list_states(self) -> List[Dict[str, Any]]:
+    def list_states_sync(self) -> List[Dict[str, Any]]:
         """
         Return all entity states from Home Assistant (`GET /api/states`).
         """
         resp = self._request("GET", "/states")
-        return resp.json()
+        data: Any = resp.json()
+        if not isinstance(data, list):
+            raise RuntimeError("Unexpected Home Assistant /api/states response shape")
+        return data
 
-    def get_state(self, entity_id: str) -> Dict[str, Any]:
+    def get_state_sync(self, entity_id: str) -> Dict[str, Any]:
         """
         Return the state for a single entity (`GET /api/states/{entity_id}`).
         """
         path = f"/states/{entity_id}"
         resp = self._request("GET", path)
-        return resp.json()
+        data: Any = resp.json()
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Unexpected Home Assistant /api/states/{entity_id} response shape")
+        return data
 
-    # ==========================
-    # Services
-    # ==========================
-
-    def list_services(self) -> List[Dict[str, Any]]:
+    def list_services_sync(self) -> List[Dict[str, Any]]:
         """
         Return all available Home Assistant services (`GET /api/services`).
         """
         resp = self._request("GET", "/services")
-        return resp.json()
+        data: Any = resp.json()
+        if not isinstance(data, list):
+            raise RuntimeError("Unexpected Home Assistant /api/services response shape")
+        return data
 
-    def call_service(
+    def call_service_sync(
         self,
         domain: str,
         service: str,
@@ -154,14 +152,6 @@ class HomeAssistantClient:
     ) -> Dict[str, Any]:
         """
         Call a Home Assistant service (`POST /api/services/{domain}/{service}`).
-
-        Args:
-            domain: e.g. "light", "switch", "script"
-            service: e.g. "turn_on", "turn_off"
-            data: payload dict passed through to Home Assistant.
-
-        Returns:
-            dict with status_code, body, and url.
         """
         path = f"/services/{domain}/{service}"
         payload: Dict[str, Any] = data or {}
@@ -173,15 +163,34 @@ class HomeAssistantClient:
         except Exception:  # noqa: BLE001
             body = resp.text
 
-        return {
-            "status_code": resp.status_code,
-            "body": body,
-            "url": self._build_url(path),
-        }
+        return {"status_code": resp.status_code, "body": body, "url": self._build_url(path)}
+
+    # --------------------------
+    # Async wrappers (FastAPI)
+    # --------------------------
+
+    async def get_config(self) -> Dict[str, Any]:
+        return await asyncio.to_thread(self.get_config_sync)
+
+    async def get_states(self) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self.list_states_sync)
+
+    async def get_state(self, entity_id: str) -> Dict[str, Any]:
+        return await asyncio.to_thread(self.get_state_sync, entity_id)
+
+    async def get_services(self) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self.list_services_sync)
+
+    async def call_service(
+        self,
+        domain: str,
+        service: str,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return await asyncio.to_thread(self.call_service_sync, domain, service, data)
 
     def close(self) -> None:
         try:
             self._session.close()
         except Exception:
-            # Not critical; ignore cleanup errors
             pass

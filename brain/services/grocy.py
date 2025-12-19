@@ -121,6 +121,9 @@ class _SingleGrocyClient:
     async def create_product(self, payload: Dict[str, Any]) -> Any:
         return await self._request("POST", "/api/objects/products", json_body=payload)
 
+    async def create_location(self, payload: Dict[str, Any]) -> Any:
+        return await self._request("POST", "/api/objects/locations", json_body=payload)
+
     async def create_product_barcode(self, payload: Dict[str, Any]) -> Any:
         return await self._request(
             "POST", "/api/objects/product_barcodes", json_body=payload
@@ -227,6 +230,70 @@ class GrocyClient:
         created = await client.create_product(payload)
         return {
             "household": household,
+            **(created if isinstance(created, dict) else {"result": created}),
+        }
+
+    async def create_location(
+        self,
+        household: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Create a Grocy location (explicit, household-scoped).
+        """
+        client = self._get_single_instance(household)
+
+        created = await client.create_location(payload)
+        return {
+            "household": household,
+            **(created if isinstance(created, dict) else {"result": created}),
+        }
+
+    async def link_barcode_to_product(
+        self,
+        household: str,
+        barcode: str,
+        product_id: int,
+    ) -> Dict[str, Any]:
+        """
+        Create a product_barcodes record in Grocy linking barcode -> product_id.
+        Phase 6.45 Step 3 requires explicit linking, no inference.
+        """
+        client = self._get_single_instance(household)
+
+        code = (barcode or "").strip()
+        if not code:
+            raise GrocyError("barcode must not be empty")
+
+        payload = {
+            "barcode": code,
+            "product_id": int(product_id),
+        }
+
+        created = await client.create_product_barcode(payload)
+        return {
+            "household": household,
+            "barcode": code,
+            "product_id": int(product_id),
+            **(created if isinstance(created, dict) else {"result": created}),
+        }
+
+    async def add_stock(
+        self,
+        household: str,
+        product_id: int,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Add stock for a product (explicit, household-scoped).
+        Phase 6.45 Step 4 uses this only when explicitly requested.
+        """
+        client = self._get_single_instance(household)
+
+        created = await client.add_stock(int(product_id), payload)
+        return {
+            "household": household,
+            "product_id": int(product_id),
             **(created if isinstance(created, dict) else {"result": created}),
         }
 
