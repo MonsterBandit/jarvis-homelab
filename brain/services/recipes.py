@@ -6,16 +6,16 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
 import httpx
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, HttpUrl
 
 router = APIRouter(prefix="/recipes", tags=["Recipes"])
 
 # ============================================================
-# Database helpers (Phase 6.75 — Recipe Draft Persistence)
+# Database helpers (Phase 6.75 — Recipe Draft + Finalization)
 # ============================================================
 
 DB_PATH = os.getenv("JARVIS_DB_PATH", "/app/data/jarvis_brain.db")
@@ -26,6 +26,13 @@ def _get_db_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    cols = {row["name"] for row in cur.fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
 def _init_recipe_drafts_table() -> None:
@@ -45,6 +52,13 @@ def _init_recipe_drafts_table() -> None:
             )
             """
         )
+
+        # Phase 6.75 — Step 3.4 (idempotent finalization columns)
+        _ensure_column(conn, "recipe_drafts", "status", "status TEXT")
+        _ensure_column(conn, "recipe_drafts", "finalized_at", "finalized_at TEXT")
+        _ensure_column(conn, "recipe_drafts", "finalized_household", "finalized_household TEXT")
+        _ensure_column(conn, "recipe_drafts", "finalized_payload", "finalized_payload TEXT")
+
         conn.commit()
     finally:
         conn.close()
@@ -58,7 +72,7 @@ _init_recipe_drafts_table()
 
 
 class ImportRecipeUrlRequest(BaseModel):
-    url: HttpUrl = Field(..., description="Recipe page URL to import")
+    url: HttpUrl
 
 
 class RawRecipe(BaseModel):
@@ -70,7 +84,7 @@ class RawRecipe(BaseModel):
 
 
 class ImportRecipeUrlResponse(BaseModel):
-    status: str = Field(..., description="complete | partial | error")
+    status: str
     warnings: List[str] = Field(default_factory=list)
     recipe: Optional[RawRecipe] = None
 
@@ -88,17 +102,64 @@ class RecipeDraftResponse(BaseModel):
     recipe: RawRecipe
     parsed_ingredients: List[Dict[str, Any]]
 
+
+Household = Literal["home_a", "home_b"]
+
+
+class RecipeDraftAnalyzeRequest(BaseModel):
+    household: Household
+    top_k: int = Field(5, ge=1, le=10)
+    min_score: float = Field(0.0, ge=0.0, le=1.0)
+
+
+class RecipeDraftAnalyzeResponse(BaseModel):
+    draft_id: int
+    recipe: RawRecipe
+    parsed_ingredients: List[Dict[str, Any]]
+    analysis: Dict[str, Any]
+    notes: List[str] = Field(default_factory=list)
+
+
+class MappingConfirmItem(BaseModel):
+    ingredient_name: str
+    product_id: int
+    product_name: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class RecipeDraftConfirmMappingsRequest(BaseModel):
+    household: Optional[Household] = None
+    items: List[MappingConfirmItem]
+    commit: bool = False
+
+
+class RecipeDraftConfirmMappingsResponse(BaseModel):
+    status: Literal["ok"] = "ok"
+    draft_id: int
+    commit: bool
+    attempted: int
+    succeeded: int
+    failed: int
+    results: List[Dict[str, Any]] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)
+
+
+class RecipeDraftFinalizeRequest(BaseModel):
+    household: Household
+    commit: bool = False
+
+
+class RecipeDraftFinalizedResponse(BaseModel):
+    draft_id: int
+    status: str
+    finalized_at: Optional[str]
+    finalized_household: Optional[str]
+    snapshot: Dict[str, Any]
+    notes: List[str] = Field(default_factory=list)
+
 # ============================================================
 # Utility helpers
 # ============================================================
-
-
-def _coerce_to_list(x: Any) -> List[Any]:
-    if x is None:
-        return []
-    if isinstance(x, list):
-        return x
-    return [x]
 
 
 def _strip_html(s: str) -> str:
@@ -124,97 +185,29 @@ def _extract_title_from_html(html: str) -> Optional[str]:
     return None
 
 
-def _find_jsonld_blocks(html: str) -> List[str]:
-    blocks = re.findall(
-        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    return [b.strip() for b in blocks if b.strip()]
-
-
-def _find_recipe_in_jsonld(obj: Any) -> Optional[Dict[str, Any]]:
-    if isinstance(obj, dict):
-        t = obj.get("@type") or obj.get("type")
-        if isinstance(t, list) and any(str(x).lower() == "recipe" for x in t):
-            return obj
-        if isinstance(t, str) and t.lower() == "recipe":
-            return obj
-
-        graph = obj.get("@graph")
-        if isinstance(graph, list):
-            for node in graph:
-                r = _find_recipe_in_jsonld(node)
-                if r:
-                    return r
-
-        for v in obj.values():
-            r = _find_recipe_in_jsonld(v)
-            if r:
-                return r
-
-    if isinstance(obj, list):
-        for item in obj:
-            r = _find_recipe_in_jsonld(item)
-            if r:
-                return r
-
-    return None
-
-
-def _normalize_instructions(recipe_node: Dict[str, Any]) -> Optional[str]:
-    ins = recipe_node.get("recipeInstructions")
-    if ins is None:
-        return None
-
-    parts: List[str] = []
-
-    for item in _coerce_to_list(ins):
-        if isinstance(item, str):
-            parts.append(_strip_html(item))
-        elif isinstance(item, dict):
-            text = item.get("text") or item.get("name")
-            if isinstance(text, str):
-                parts.append(_strip_html(text))
-
-    if not parts:
-        return None
-
-    return "\n".join(f"{i+1}. {p}" for i, p in enumerate(parts))
-
-
-def _normalize_ingredients(recipe_node: Dict[str, Any]) -> List[str]:
-    ings = recipe_node.get("recipeIngredient") or recipe_node.get("ingredients")
-    out: List[str] = []
-    for item in _coerce_to_list(ings):
-        if isinstance(item, str):
-            s = _strip_html(item)
-            if s:
-                out.append(s)
-    return out
-
-
-def _extract_servings(recipe_node: Dict[str, Any]) -> Optional[str]:
-    y = recipe_node.get("recipeYield") or recipe_node.get("yield")
-    if isinstance(y, (int, float)):
-        return str(y)
-    if isinstance(y, str):
-        return y.strip()
-    if isinstance(y, list) and y:
-        return str(y[0])
-    return None
-
-
 async def _fetch_html(url: str) -> Tuple[Optional[str], Optional[str]]:
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
-            r = await client.get(
-                url, headers={"User-Agent": "ISAC/RecipeImporter"}
-            )
+            r = await client.get(url, headers={"User-Agent": "ISAC/RecipeImporter"})
             r.raise_for_status()
             return r.text, None
     except Exception as e:
         return None, str(e)
+
+
+async def _post_json(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"http://127.0.0.1:8000{path}"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(url, json=payload)
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"detail": resp.text}
+
+    if resp.status_code >= 400:
+        return {"error": True, "detail": data}
+
+    return data
 
 # ============================================================
 # Draft persistence helpers
@@ -254,25 +247,109 @@ def _store_recipe_draft(raw: RawRecipe, parsed: List[Dict[str, Any]]) -> int:
         conn.close()
 
 
-def _load_recipe_draft(draft_id: int) -> Tuple[RawRecipe, List[Dict[str, Any]]]:
+def _load_recipe_draft_row(draft_id: int) -> sqlite3.Row:
     conn = _get_db_conn()
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM recipe_drafts WHERE id = ?", (draft_id,))
+        cur = conn.execute("SELECT * FROM recipe_drafts WHERE id = ?", (draft_id,))
         row = cur.fetchone()
         if not row:
             raise KeyError("draft_not_found")
+        return row
+    finally:
+        conn.close()
 
-        raw = RawRecipe(
-            title=row["title"],
-            servings=row["servings"],
-            ingredient_lines=json.loads(row["raw_ingredient_lines"]),
-            instructions=row["instructions"],
-            source_url=row["source_url"],
+
+def _load_recipe_draft(draft_id: int) -> Tuple[RawRecipe, List[Dict[str, Any]]]:
+    row = _load_recipe_draft_row(draft_id)
+    raw = RawRecipe(
+        title=row["title"],
+        servings=row["servings"],
+        ingredient_lines=json.loads(row["raw_ingredient_lines"]),
+        instructions=row["instructions"],
+        source_url=row["source_url"],
+    )
+    parsed = json.loads(row["parsed_ingredients"])
+    return raw, parsed
+
+# ============================================================
+# Finalization helpers (Phase 6.75 — Step 3.4)
+# ============================================================
+
+
+async def _resolve_ingredients(
+    household: Household, parsed: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Attempt to resolve ingredient mappings.
+    If resolution is unavailable or fails, gracefully fall back
+    to parsed ingredients with explicit metadata.
+    """
+    resp = await _post_json(
+        "/recipes/mappings/resolve",
+        {"household": household, "parsed_ingredients": parsed},
+    )
+
+    if resp.get("error"):
+        return {
+            "resolution_status": "unresolved",
+            "ingredients": parsed,
+            "notes": ["No ingredient mappings applied"],
+        }
+
+    return {
+        "resolution_status": "resolved",
+        "ingredients": resp.get("resolved", resp),
+        "notes": ["Ingredient mappings applied with household precedence"],
+    }
+
+
+def _build_final_snapshot(
+    draft_id: int,
+    household: Household,
+    raw: RawRecipe,
+    parsed: List[Dict[str, Any]],
+    resolved_block: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "draft_id": draft_id,
+        "household": household,
+        "raw_recipe": raw.model_dump(),
+        "parsed_ingredients": parsed,
+        "resolved_ingredients": resolved_block["ingredients"],
+        "resolution_status": resolved_block["resolution_status"],
+        "metadata": {
+            "finalized_by": "isac",
+            "finalized_at": datetime.now(timezone.utc).isoformat(),
+            "notes": [
+                "Frozen recipe snapshot for meal planning",
+                *resolved_block.get("notes", []),
+                "No Grocy writes",
+                "No inventory changes",
+                "ISAC-owned data only",
+            ],
+        },
+    }
+
+
+def _persist_finalization(
+    draft_id: int, household: Household, snapshot: Dict[str, Any]
+) -> Tuple[str, str]:
+    conn = _get_db_conn()
+    try:
+        ts = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """
+            UPDATE recipe_drafts
+            SET status = ?,
+                finalized_at = ?,
+                finalized_household = ?,
+                finalized_payload = ?
+            WHERE id = ?
+            """,
+            ("finalized", ts, household, json.dumps(snapshot), draft_id),
         )
-
-        parsed = json.loads(row["parsed_ingredients"])
-        return raw, parsed
+        conn.commit()
+        return "finalized", ts
     finally:
         conn.close()
 
@@ -281,60 +358,8 @@ def _load_recipe_draft(draft_id: int) -> Tuple[RawRecipe, List[Dict[str, Any]]]:
 # ============================================================
 
 
-@router.post("/import/url", response_model=ImportRecipeUrlResponse)
-async def import_recipe_from_url(
-    payload: ImportRecipeUrlRequest,
-) -> ImportRecipeUrlResponse:
-    html, err = await _fetch_html(str(payload.url))
-    if err or not html:
-        return ImportRecipeUrlResponse(status="error", warnings=[err or "fetch failed"])
-
-    recipe_node: Optional[Dict[str, Any]] = None
-    for block in _find_jsonld_blocks(html):
-        try:
-            data = json.loads(block)
-        except Exception:
-            continue
-        recipe_node = _find_recipe_in_jsonld(data)
-        if recipe_node:
-            break
-
-    title = None
-    servings = None
-    ingredients: List[str] = []
-    instructions = None
-    warnings: List[str] = []
-
-    if recipe_node:
-        title = recipe_node.get("name")
-        servings = _extract_servings(recipe_node)
-        ingredients = _normalize_ingredients(recipe_node)
-        instructions = _normalize_instructions(recipe_node)
-    else:
-        warnings.append("No JSON-LD recipe found")
-
-    if not title:
-        title = _extract_title_from_html(html)
-
-    recipe = RawRecipe(
-        title=title,
-        servings=servings,
-        ingredient_lines=ingredients,
-        instructions=instructions,
-        source_url=str(payload.url),
-    )
-
-    return ImportRecipeUrlResponse(
-        status="complete" if not warnings else "partial",
-        warnings=warnings,
-        recipe=recipe,
-    )
-
-
 @router.post("/draft", response_model=RecipeDraftResponse)
-async def create_recipe_draft(
-    payload: RecipeDraftCreateRequest,
-) -> RecipeDraftResponse:
+async def create_recipe_draft(payload: RecipeDraftCreateRequest) -> RecipeDraftResponse:
     from services.ingredient_parser import parse_ingredient_lines
 
     raw = RawRecipe(
@@ -348,22 +373,76 @@ async def create_recipe_draft(
     parsed = parse_ingredient_lines(payload.ingredient_lines)
     draft_id = _store_recipe_draft(raw, parsed)
 
-    return RecipeDraftResponse(
+    return RecipeDraftResponse(draft_id=draft_id, recipe=raw, parsed_ingredients=parsed)
+
+
+@router.post(
+    "/draft/{draft_id}/finalize",
+    response_model=RecipeDraftFinalizedResponse,
+)
+async def finalize_recipe_draft(
+    draft_id: int, body: RecipeDraftFinalizeRequest
+) -> RecipeDraftFinalizedResponse:
+    row = _load_recipe_draft_row(draft_id)
+    raw, parsed = _load_recipe_draft(draft_id)
+
+    resolved_block = await _resolve_ingredients(body.household, parsed)
+    snapshot = _build_final_snapshot(
+        draft_id, body.household, raw, parsed, resolved_block
+    )
+
+    if not body.commit:
+        return RecipeDraftFinalizedResponse(
+            draft_id=draft_id,
+            status=row["status"] or "draft",
+            finalized_at=None,
+            finalized_household=None,
+            snapshot=snapshot,
+            notes=[
+                "Preview only",
+                "No database writes",
+                "No Grocy writes",
+            ],
+        )
+
+    status, ts = _persist_finalization(draft_id, body.household, snapshot)
+
+    return RecipeDraftFinalizedResponse(
         draft_id=draft_id,
-        recipe=raw,
-        parsed_ingredients=parsed,
+        status=status,
+        finalized_at=ts,
+        finalized_household=body.household,
+        snapshot=snapshot,
+        notes=[
+            "Recipe draft finalized",
+            "Frozen snapshot persisted to ISAC SQLite",
+            "No Grocy writes",
+            "No inventory changes",
+        ],
     )
 
 
-@router.get("/draft/{draft_id}", response_model=RecipeDraftResponse)
-async def get_recipe_draft(draft_id: int) -> RecipeDraftResponse:
-    try:
-        raw, parsed = _load_recipe_draft(draft_id)
-    except KeyError:
-        raise ValueError(f"Recipe draft {draft_id} not found")
+@router.get(
+    "/draft/{draft_id}/finalized",
+    response_model=RecipeDraftFinalizedResponse,
+)
+async def get_finalized_recipe_draft(draft_id: int) -> RecipeDraftFinalizedResponse:
+    row = _load_recipe_draft_row(draft_id)
 
-    return RecipeDraftResponse(
+    if not row["finalized_payload"]:
+        raise HTTPException(status_code=404, detail="Draft not finalized")
+
+    snapshot = json.loads(row["finalized_payload"])
+
+    return RecipeDraftFinalizedResponse(
         draft_id=draft_id,
-        recipe=raw,
-        parsed_ingredients=parsed,
+        status=row["status"],
+        finalized_at=row["finalized_at"],
+        finalized_household=row["finalized_household"],
+        snapshot=snapshot,
+        notes=[
+            "Read-only finalized snapshot",
+            "No Grocy writes",
+            "No inventory changes",
+        ],
     )
