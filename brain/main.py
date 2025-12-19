@@ -851,6 +851,30 @@ def _parse_iso_to_dt(iso_str: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _clip_interval_to_day(
+    start: datetime,
+    end: datetime,
+    day_start: datetime,
+    day_end: datetime,
+) -> int:
+    """
+    Return overlap in minutes between [start, end) and a single day window.
+    """
+    latest_start = max(start, day_start)
+    earliest_end = min(end, day_end)
+    if earliest_end <= latest_start:
+        return 0
+    return int((earliest_end - latest_start).total_seconds() // 60)
+
+
+def _busy_score_from_minutes(minutes: int) -> int:
+    """
+    Convert busy minutes to a 0–100 score.
+    8h (480m) == 100, linear scale, capped.
+    """
+    return min(100, int((minutes / 480) * 100))        
+
+
 @calendar_router.get("/entities")
 async def calendar_entities(
     household: Optional[str] = Query(
@@ -997,6 +1021,116 @@ async def calendar_week(
             "No DB writes, no HA writes, no event creation.",
             "Week window is Sunday-start and derived from server time.",
             "POLISH A: normalized start/end fields and sorting; raw optional.",
+        ],
+    }
+
+
+@calendar_router.get("/busy/week")
+async def calendar_busy_week(
+    offset_weeks: int = Query(
+        default=0,
+        description="0=current week (Sunday-start), 1=next week, -1=previous week",
+    ),
+    household: Optional[str] = Query(
+        default="home_a",
+        description="home_a | home_b",
+    ),
+) -> Dict[str, Any]:
+    """
+    Read-only calendar busyness aggregation.
+    Produces per-day workload signals for planning awareness.
+    """
+    hh = _normalize_calendar_household(household)
+    tz = get_server_timezone()
+
+    window_start, window_end = planning_window_week(
+        offset_weeks=offset_weeks, tz=tz
+    )
+
+    calendars = get_enabled_calendar_entities_for_household(hh)
+    all_events: List[Dict[str, Any]] = []
+
+    for cal in calendars:
+        entity_id = cal.get("entity_id")
+        if not entity_id or entity_id in CALENDAR_ENTITY_IGNORE:
+            continue
+
+        events = await ha_calendar_get_events(
+            entity_id=entity_id,
+            start=window_start,
+            end=window_end,
+        )
+
+        for ev in events:
+            start_iso, start_all_day = _coerce_ha_time_to_iso(ev.get("start"), tz=tz)
+            end_iso, end_all_day = _coerce_ha_time_to_iso(ev.get("end"), tz=tz)
+
+            start_dt = _parse_iso_to_dt(start_iso)
+            end_dt = _parse_iso_to_dt(end_iso)
+
+            if not start_dt or not end_dt:
+                continue
+
+            all_events.append(
+                {
+                    "start": start_dt,
+                    "end": end_dt,
+                    "all_day": bool(ev.get("all_day") or start_all_day or end_all_day),
+                    "summary": ev.get("summary") or ev.get("title"),
+                }
+            )
+
+    busy_by_day: List[Dict[str, Any]] = []
+
+    for day_offset in range(7):
+        day_start = window_start + timedelta(days=day_offset)
+        day_end = day_start + timedelta(days=1)
+
+        day_events = []
+        busy_minutes = 0
+        all_day_count = 0
+
+        for ev in all_events:
+            if ev["all_day"]:
+                if ev["start"].date() == day_start.date():
+                    all_day_count += 1
+                continue
+
+            minutes = _clip_interval_to_day(
+                ev["start"], ev["end"], day_start, day_end
+            )
+            if minutes > 0:
+                busy_minutes += minutes
+                day_events.append(ev)
+
+        summaries = [
+            e["summary"] for e in day_events if e.get("summary")
+        ][:3]
+
+        busy_by_day.append(
+            {
+                "date": day_start.date().isoformat(),
+                "event_count": len(day_events) + all_day_count,
+                "all_day_count": all_day_count,
+                "busy_minutes": busy_minutes,
+                "busy_score": _busy_score_from_minutes(busy_minutes),
+                "top_summaries": summaries,
+            }
+        )
+
+    return {
+        "status": "ok",
+        "household": hh,
+        "timezone": getattr(tz, "key", str(tz)),
+        "window": {
+            "start": window_start.isoformat(),
+            "end": window_end.isoformat(),
+        },
+        "busy_by_day": busy_by_day,
+        "notes": [
+            "Read-only calendar awareness signal",
+            "No DB writes, no HA writes",
+            "Designed for meal planning + UI hints",
         ],
     }
 
