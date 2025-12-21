@@ -24,6 +24,16 @@ Stability Fix:
     - WAL mode
     - retry wrapper
     - avoid migrations at import time to reduce lock contention
+
+Phase 6.8 Tightening (metadata-only; no schema changes; no behavior changes outside snapshot metadata):
+- 6.8A: Servings semantics surfaced in finalized snapshot metadata:
+    - declared_servings (raw string)
+    - parsed_servings (best-effort number)
+    - servings_confidence (high/medium/low/none)
+- 6.8B: Ingredient confidence summary surfaced in finalized snapshot metadata
+- 6.8C: Explicit concept-only declaration in finalized snapshot metadata:
+    - ingredient_model="concept-only"
+    - variant_resolution="deferred"
 """
 
 from __future__ import annotations
@@ -521,15 +531,86 @@ def _row_json(row: sqlite3.Row, keys: List[str], default: Any) -> Any:
     return default
 
 
+# -----------------------------------------------------------------------------
+# Phase 6.8 tightening helpers (metadata-only)
+# -----------------------------------------------------------------------------
+
+_SERVINGS_NUM_RE = re.compile(r"(\d+(?:\.\d+)?)")
+
+
+def _servings_metadata(raw_recipe: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Phase 6.8A: Surface servings semantics in snapshot metadata.
+
+    - declared_servings: raw string if present (human-facing)
+    - parsed_servings: float if unambiguous, else None
+    - servings_confidence: high/medium/low/none
+    """
+    declared = raw_recipe.get("servings")
+    if declared is None:
+        return {"declared_servings": None, "parsed_servings": None, "servings_confidence": "none"}
+
+    declared_str = str(declared).strip()
+    if not declared_str:
+        return {"declared_servings": "", "parsed_servings": None, "servings_confidence": "low"}
+
+    nums = [float(m.group(1)) for m in _SERVINGS_NUM_RE.finditer(declared_str)]
+    nums = [n for n in nums if n > 0]
+
+    if len(nums) == 1:
+        return {"declared_servings": declared_str, "parsed_servings": nums[0], "servings_confidence": "high"}
+
+    if len(nums) >= 2:
+        # Ambiguous like "Serves 4-6" or "4 to 6"
+        return {"declared_servings": declared_str, "parsed_servings": None, "servings_confidence": "medium"}
+
+    return {"declared_servings": declared_str, "parsed_servings": None, "servings_confidence": "low"}
+
+
+def _ingredient_confidence_summary(ingredients: List[Dict[str, Any]]) -> Dict[str, int]:
+    """
+    Phase 6.8B: Count confidence levels across ingredient parse results.
+    """
+    summary = {"high": 0, "medium": 0, "low": 0, "unknown": 0}
+    for ing in ingredients or []:
+        try:
+            c = (ing.get("confidence") or "unknown").strip().lower()
+        except Exception:
+            c = "unknown"
+        if c in summary:
+            summary[c] += 1
+        else:
+            summary["unknown"] += 1
+    return summary
+
+
 def _build_snapshot_from_row(row: sqlite3.Row, household: str) -> "FinalizedSnapshot":
     raw_recipe = _row_json(row, ["raw_recipe_json"], default={})
     parsed = _row_json(row, ["parsed_ingredients_json", "parsed_ingredients"], default=[])
     resolved = _row_json(row, ["resolved_ingredients_json"], default=[]) or parsed
     resolution_status = _rv(row, "resolution_status", "unresolved")
 
+    # Phase 6.8 tightening: metadata-only signals
+    servings_meta = _servings_metadata(raw_recipe)
+    confidence_summary = _ingredient_confidence_summary(resolved if isinstance(resolved, list) else parsed)
+
     metadata = {
+        # 6.8C: explicit concept-only declaration
+        "ingredient_model": "concept-only",
+        "variant_resolution": "deferred",
+
+        # existing metadata
         "finalized_by": "isac",
         "finalized_at": _rv(row, "finalized_at", None),
+
+        # 6.8A servings
+        "declared_servings": servings_meta["declared_servings"],
+        "parsed_servings": servings_meta["parsed_servings"],
+        "servings_confidence": servings_meta["servings_confidence"],
+
+        # 6.8B ingredient confidence
+        "ingredient_confidence_summary": confidence_summary,
+
         "notes": [
             "Frozen recipe snapshot for meal planning",
             "No ingredient mappings applied",
