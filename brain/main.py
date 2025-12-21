@@ -155,6 +155,13 @@ def init_db() -> None:
         # -------------------------------------------------
         # Phase 6.9 — Calendar ownership & mapping (READ-ONLY)
         # -------------------------------------------------
+        #
+        # CONTRACT (LOCKED):
+        # - These tables map calendar entities to owners/households only.
+        # - We do NOT store calendar events in SQLite.
+        # - We do NOT write any calendar-derived read results to SQLite.
+        # - Calendar awareness is consumptive/descriptive only (context, not control).
+        #
 
         # Maps a person/owner to a household
         cur.execute(
@@ -697,9 +704,29 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
 
 # ---------------------------------------------------------
 # Phase 6.9 — Calendar awareness router (READ-ONLY)
-# Server-time based windows, Sunday-first weeks
-# No HA writes, no DB writes, no creation
 # ---------------------------------------------------------
+# CONTRACT (LOCKED):
+# - Read-only signal layer. Context, not control.
+# - No calendar writes. No scheduling. No reminders. No automation.
+# - No Home Assistant actions (no service calls).
+# - No database writes tied to calendar reads.
+# - Ambiguity surfaces as notes/warnings, not assumptions.
+#
+# TIME RULES (LOCKED):
+# - Server-time is authoritative.
+# - Week starts on Sunday.
+#
+# ENTITY RULES (LOCKED):
+# - Household-enabled entities come from DB mapping tables.
+# - Hard ignore list always applies: CALENDAR_ENTITY_IGNORE
+#
+# Endpoints (READ-ONLY):
+# - GET /calendar/entities
+# - GET /calendar/today
+# - GET /calendar/week
+# - GET /calendar/busy/week
+# ---------------------------------------------------------
+
 
 calendar_router = APIRouter(
     prefix="/calendar",
