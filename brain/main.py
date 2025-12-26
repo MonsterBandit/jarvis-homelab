@@ -51,6 +51,8 @@ from services.recipe_analyzer import router as recipe_analyzer_router  # Phase 6
 from services.recipe_mappings import router as recipe_mappings_router  # Phase 6.75.5
 from services.mealplans import router as mealplans_router
 from services.mealplanner import router as mealplanner_context_router
+# Alice (Phase 8) — read-only preview endpoint (NOT wired into /ask)
+from alice_preview_router import router as alice_router
 
 
 # ----------------------------
@@ -3075,6 +3077,10 @@ async def model_client_error_handler(
 # ----------------------------
 
 app.include_router(health_router)
+
+# Alice (Phase 8) — read-only preview endpoint
+app.include_router(alice_router)
+
 app.include_router(ha_router)
 app.include_router(calendar_router)
 app.include_router(grocy_router)
