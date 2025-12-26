@@ -125,9 +125,7 @@ def disagreement_no_resolve_needed() -> str:
 
 
 def boundary_hard() -> str:
-    return (
-        "I can’t proceed with that because it would cross a system boundary that’s locked right now."
-    )
+    return "This request crosses a system boundary that is currently locked."
 
 
 def boundary_source_intro(source: str) -> str:

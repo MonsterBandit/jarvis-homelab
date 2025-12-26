@@ -47,11 +47,14 @@ def mediate(signal: IsacSignal, learning_state: Optional[LearningState] = None) 
     # 0) If boundaries exist, render them first. Boundaries are high-salience.
     if signal.boundaries:
         b_lines, b_echo = boundary_render.render_boundaries(signal.boundaries)
+
+        # Present boundary clearly and without emotional framing.
+        utter_lines.append("There is a system boundary in effect right now.")
         utter_lines.extend(b_lines)
+
         boundary_echo.extend(b_echo)
 
-        # If boundaries exist, we avoid adding additional questions unless
-        # the signal itself is UNCERTAIN and no boundary is HARD.
+        # Choose containment move based on risk.
         move = AliceMove.DEFER if signal.kind == IsacSignalKind.RISK else AliceMove.PAUSE
 
         # Add minimal context (title/summary) after boundary block.
@@ -65,6 +68,7 @@ def mediate(signal: IsacSignal, learning_state: Optional[LearningState] = None) 
             boundary_echo=boundary_echo,
             signal=signal,
         )
+        
 
     # 1) No boundaries: proceed by signal kind.
     utter_lines.extend(_title_and_summary(signal))
