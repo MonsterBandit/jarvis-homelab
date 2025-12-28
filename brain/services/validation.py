@@ -1,6 +1,6 @@
-from typing import Any, Optional
+from typing import Any, Optional, List
 
-from brain.validators.base import ValidatorContext
+from brain.validators.base import ValidatorContext, ValidatorResult
 from brain.validators.runner import run_validators
 from brain.validators.snapshot import ValidationSnapshot
 from brain.validators.health import HealthAggregate
@@ -12,18 +12,19 @@ def run_domain_validation(
     data: Any,
     ctx: ValidatorContext,
     health: Optional[HealthAggregate] = None,
+    extra_results: Optional[List[ValidatorResult]] = None,
 ) -> ValidationSnapshot:
     """
     Explicitly run validators for a given domain against provided data
     and return an immutable validation snapshot.
 
-    If a HealthAggregate is provided, the snapshot is appended to it.
+    Optional extra_results allow deliberate, one-off checks to be
+    included without registry coupling.
 
     This function is:
     - Read-only
+    - Explicit
     - Side-effect free (except optional in-memory aggregation)
-    - Explicitly invoked
-    - Not wired to any execution path by default
     """
 
     results = run_validators(
@@ -31,6 +32,9 @@ def run_domain_validation(
         data=data,
         ctx=ctx,
     )
+
+    if extra_results:
+        results = list(results) + list(extra_results)
 
     snapshot = ValidationSnapshot(
         domain=domain,

@@ -1,27 +1,18 @@
 """
 Internal, explicit health capture for ISAC.
-
-This module:
-- Creates an in-memory HealthAggregate
-- Runs selected validations explicitly
-- Returns the aggregate
-- Does not persist, log, or act on results
 """
 
 from brain.validators.health import HealthAggregate
 from brain.validators.base import ValidatorContext
 from brain.services.validation import run_domain_validation
+from brain.validators.sanity import non_empty_string
 
 
 def capture_internal_health() -> HealthAggregate:
     """
     Capture a snapshot of internal ISAC health.
 
-    This is:
-    - Explicit
-    - Read-only
-    - In-memory only
-    - Safe under Gate D
+    Explicit, read-only, in-memory only.
     """
 
     health = HealthAggregate()
@@ -31,12 +22,15 @@ def capture_internal_health() -> HealthAggregate:
         source="internal_capture",
     )
 
-    # Example minimal capture (expand later, deliberately)
+    # A1: Domain identity sanity (explicit, deliberate)
+    domain_result = non_empty_string(ctx.domain, ctx)
+
     run_domain_validation(
         domain="isac_internal",
         data={},
         ctx=ctx,
         health=health,
+        extra_results=[domain_result],
     )
 
     return health
