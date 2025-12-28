@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-from brain.validators.base import BaseValidator
-from brain.validators.presence import NonEmptyValidator
-from brain.validators.staleness import AgeStalenessValidator
+from validators.base import BaseValidator
+from validators.presence import NonEmptyValidator
+from validators.staleness import AgeStalenessValidator
 
 
 class ValidatorRegistry:

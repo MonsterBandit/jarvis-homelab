@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from brain.validators.base import (
+from validators.base import (
     BaseValidator,
     ValidatorContext,
     ValidatorResult,

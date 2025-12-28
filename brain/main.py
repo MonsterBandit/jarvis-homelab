@@ -53,6 +53,7 @@ from services.mealplans import router as mealplans_router
 from services.mealplanner import router as mealplanner_context_router
 # Alice (Phase 8) — read-only preview endpoint (NOT wired into /ask)
 from alice_preview_router import router as alice_router
+from health_capture import capture_internal_health
 
 
 # ----------------------------
@@ -702,6 +703,26 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
 
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+def require_admin_if_configured(
+    x_isac_admin_key: Optional[str] = Header(default=None),
+) -> None:
+    """
+    Admin-safe gating for sensitive read-only endpoints.
+    - If ISAC_ADMIN_KEY is not set: no-op (open access).
+    - If ISAC_ADMIN_KEY is set: require X-ISAC-Admin-Key to match.
+    """
+    configured = (
+        os.getenv("ISAC_ADMIN_API_KEY")
+        or os.getenv("ISAC_ADMIN_KEY")
+    )
+
+    if not configured:   
+        return
+
+    if x_isac_admin_key != configured:
+        raise HTTPException(status_code=401, detail="Invalid or missing admin key")
 
 
 # ---------------------------------------------------------
@@ -1418,6 +1439,27 @@ health_router = APIRouter(prefix="/health", tags=["health"])
 @health_router.get("/ping")
 async def ping() -> Dict[str, Any]:
     return {"status": "ok", "message": "ISAC brain is alive"}
+
+
+@health_router.get("/isac_internal")
+async def health_isac_internal(
+    _admin_ok: None = Depends(require_admin_if_configured),
+) -> Dict[str, Any]:
+    """
+    Read-only internal health snapshot captured at request time.
+    - Explicit capture-on-request
+    - No persistence
+    - No decisions
+    - Admin-safe (only gated if ISAC_ADMIN_KEY is configured)
+    """
+    snapshot = capture_internal_health()
+
+    # Pydantic v2 -> model_dump; v1 -> dict; fallback -> raw object
+    if hasattr(snapshot, "model_dump"):
+        return snapshot.model_dump()
+    if hasattr(snapshot, "dict"):
+        return snapshot.dict()
+    return {"snapshot": snapshot}
 
 
 @health_router.get("/system")

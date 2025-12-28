@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any, List, Optional
 
-from brain.validators.base import ValidatorContext, ValidatorResult
-from brain.validators.registry import ValidatorRegistry
+from validators.base import ValidatorContext, ValidatorResult
+from validators.registry import ValidatorRegistry
 
 
 def run_validators(

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from brain.validators.base import (
+from validators.base import (
     ValidatorContext,
     ValidatorResult,
     ValidatorStatus,

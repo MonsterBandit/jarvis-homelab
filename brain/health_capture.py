@@ -2,10 +2,10 @@
 Internal, explicit health capture for ISAC.
 """
 
-from brain.validators.health import HealthAggregate
-from brain.validators.base import ValidatorContext
-from brain.services.validation import run_domain_validation
-from brain.validators.sanity import non_empty_string
+from validators.health import HealthAggregate
+from validators.base import ValidatorContext
+from services.validation import run_domain_validation
+from validators.sanity import non_empty_string
 
 
 def capture_internal_health() -> HealthAggregate:

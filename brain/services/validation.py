@@ -1,9 +1,9 @@
 from typing import Any, Optional, List
 
-from brain.validators.base import ValidatorContext, ValidatorResult
-from brain.validators.runner import run_validators
-from brain.validators.snapshot import ValidationSnapshot
-from brain.validators.health import HealthAggregate
+from validators.base import ValidatorContext, ValidatorResult
+from validators.runner import run_validators
+from validators.snapshot import ValidationSnapshot
+from validators.health import HealthAggregate
 
 
 def run_domain_validation(
