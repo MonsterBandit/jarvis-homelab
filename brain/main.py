@@ -54,6 +54,7 @@ from services.mealplanner import router as mealplanner_context_router
 # Alice (Phase 8) — read-only preview endpoint (NOT wired into /ask)
 from alice_preview_router import router as alice_router
 from health_capture import capture_internal_health
+from system_health_capture import capture_system_health
 
 
 # ----------------------------
@@ -1463,42 +1464,34 @@ async def health_isac_internal(
 
 
 @health_router.get("/system")
-async def system_health() -> Dict[str, Any]:
-    hostname = socket.gethostname()
-    boot_time = datetime.fromtimestamp(psutil.boot_time(), tz=timezone.utc)
-    now = datetime.now(timezone.utc)
-    uptime_seconds = (now - boot_time).total_seconds()
+async def system_health(
+    _admin_ok: None = Depends(require_admin_if_configured),
+) -> Dict[str, Any]:
+    """
+    Read-only external/system health snapshot captured at request time.
+    - Explicit capture-on-request
+    - No persistence
+    - No decisions
+    - Admin-safe (only gated if ISAC_ADMIN_API_KEY / ISAC_ADMIN_KEY is configured)
+    """
+    if HA_CLIENT is None:
+        return {
+            "domain": "system_external",
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "capture_duration_ms": 0,
+            "checks": {
+                "homeassistant": {
+                    "ok": False,
+                    "error": "homeassistant_not_configured",
+                }
+            },
+            "notes": [
+                "HOMEASSISTANT_BASE_URL / HOMEASSISTANT_TOKEN missing; HA check skipped.",
+                "All behavior is read-only and non-persistent.",
+            ],
+        }
 
-    cpu_percent = psutil.cpu_percent(interval=0.2)
-    virtual_mem = psutil.virtual_memory()
-    swap_mem = psutil.swap_memory()
-    disk_usage = psutil.disk_usage("/")
-
-    return {
-        "status": "ok",
-        "hostname": hostname,
-        "time_utc": now.isoformat(),
-        "uptime_seconds": uptime_seconds,
-        "cpu_percent": cpu_percent,
-        "memory": {
-            "total": virtual_mem.total,
-            "available": virtual_mem.available,
-            "used": virtual_mem.used,
-            "percent": virtual_mem.percent,
-        },
-        "swap": {
-            "total": swap_mem.total,
-            "used": swap_mem.used,
-            "free": swap_mem.free,
-            "percent": swap_mem.percent,
-        },
-        "disk": {
-            "total": disk_usage.total,
-            "used": disk_usage.used,
-            "free": disk_usage.free,
-            "percent": disk_usage.percent,
-        },
-    }
+    return await capture_system_health(HA_CLIENT)
 
 
 @health_router.get("/database")

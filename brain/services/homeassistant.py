@@ -11,7 +11,7 @@ import requests
 class HomeAssistantConfig:
     base_url: str
     token: str
-    timeout: float = 8.0  # Phase 5.6: slightly more generous default
+    timeout: float = 8.0  # slightly more generous default
 
     @property
     def api_base(self) -> str:
@@ -23,9 +23,8 @@ class HomeAssistantClient:
     Home Assistant HTTP API client.
 
     NOTE ON ASYNC:
-    Your FastAPI routes use `await client.get_states()` and `await client.get_config()`.
-    This client uses `requests` internally (sync), so we expose async wrappers that run
-    sync methods in a thread via `asyncio.to_thread`.
+    This client uses `requests` internally (sync). For FastAPI usage we expose
+    async wrappers that run sync methods in a thread via `asyncio.to_thread`.
     """
 
     def __init__(self, config: HomeAssistantConfig) -> None:
@@ -64,8 +63,7 @@ class HomeAssistantClient:
             )
         except requests.Timeout as exc:  # noqa: BLE001
             raise RuntimeError(
-                f"Home Assistant request to {url} timed out after "
-                f"{self.config.timeout} seconds"
+                f"Home Assistant request to {url} timed out after {self.config.timeout} seconds"
             ) from exc
         except requests.RequestException as exc:  # noqa: BLE001
             raise RuntimeError(f"Error communicating with Home Assistant at {url}: {exc}") from exc
@@ -86,7 +84,8 @@ class HomeAssistantClient:
 
     def health(self) -> Tuple[bool, Dict[str, Any]]:
         """
-        Call HA /api/ endpoint to verify connectivity.
+        Legacy/simple health call: GET /api/ and verify we got a dict with "message".
+        Returns (ok, payload).
         """
         url = self._build_url("/")
         try:
@@ -100,13 +99,37 @@ class HomeAssistantClient:
             data = resp.text
 
         ok = resp.status_code == 200 and isinstance(data, dict) and "message" in data
-
         return ok, {"status_code": resp.status_code, "body": data, "url": url}
 
+    def health_check_sync(self) -> Dict[str, Any]:
+        """
+        Canonical health check for observability capture:
+        returns a single sanitized dict (no tuples).
+        """
+        ok, payload = self.health()
+        result: Dict[str, Any] = {"ok": bool(ok)}
+
+        # Preserve a few useful fields, but avoid huge dumps.
+        if isinstance(payload, dict):
+            if "url" in payload:
+                result["url"] = payload.get("url")
+            if "status_code" in payload:
+                result["status_code"] = payload.get("status_code")
+
+            body = payload.get("body")
+            if isinstance(body, dict):
+                msg = body.get("message")
+                if isinstance(msg, str) and msg.strip():
+                    result["message"] = msg.strip()
+
+        # If legacy payload carried an error, bubble it up (sanitized).
+        err = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(err, str) and err.strip():
+            result["error"] = err.strip()
+
+        return result
+
     def get_config_sync(self) -> Dict[str, Any]:
-        """
-        Return Home Assistant instance config (`GET /api/config`).
-        """
         resp = self._request("GET", "/config")
         data: Any = resp.json()
         if not isinstance(data, dict):
@@ -114,9 +137,6 @@ class HomeAssistantClient:
         return data
 
     def list_states_sync(self) -> List[Dict[str, Any]]:
-        """
-        Return all entity states from Home Assistant (`GET /api/states`).
-        """
         resp = self._request("GET", "/states")
         data: Any = resp.json()
         if not isinstance(data, list):
@@ -124,9 +144,6 @@ class HomeAssistantClient:
         return data
 
     def get_state_sync(self, entity_id: str) -> Dict[str, Any]:
-        """
-        Return the state for a single entity (`GET /api/states/{entity_id}`).
-        """
         path = f"/states/{entity_id}"
         resp = self._request("GET", path)
         data: Any = resp.json()
@@ -135,9 +152,6 @@ class HomeAssistantClient:
         return data
 
     def list_services_sync(self) -> List[Dict[str, Any]]:
-        """
-        Return all available Home Assistant services (`GET /api/services`).
-        """
         resp = self._request("GET", "/services")
         data: Any = resp.json()
         if not isinstance(data, list):
@@ -150,9 +164,6 @@ class HomeAssistantClient:
         service: str,
         data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """
-        Call a Home Assistant service (`POST /api/services/{domain}/{service}`).
-        """
         path = f"/services/{domain}/{service}"
         payload: Dict[str, Any] = data or {}
 
@@ -168,6 +179,9 @@ class HomeAssistantClient:
     # --------------------------
     # Async wrappers (FastAPI)
     # --------------------------
+
+    async def health_check(self) -> Dict[str, Any]:
+        return await asyncio.to_thread(self.health_check_sync)
 
     async def get_config(self) -> Dict[str, Any]:
         return await asyncio.to_thread(self.get_config_sync)

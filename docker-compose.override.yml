@@ -1,0 +1,31 @@
+# ============================================================
+# Jarvis Docker Compose Override
+#
+# Purpose:
+# Permanently attach Jarvis services to the arr/NPM stack
+# network so Nginx Proxy Manager can reverse-proxy them.
+#
+# This file intentionally contains ONLY cross-stack glue.
+# ============================================================
+
+# ------------------------------------------------------------
+# External network from arr / NPM stack
+# ------------------------------------------------------------
+networks:
+  compose_default:
+    external: true
+    name: compose_default
+
+# ------------------------------------------------------------
+# Attach Jarvis services to both networks
+# ------------------------------------------------------------
+services:
+  jarvis-agent:
+    networks:
+      - jarvis_net
+      - compose_default
+
+  jarvis-brain:
+    networks:
+      - jarvis_net
+      - compose_default

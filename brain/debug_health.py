@@ -11,8 +11,8 @@ It is:
 - Never auto-invoked
 """
 
-from brain.health_capture import capture_internal_health
-from brain.validators.health import HealthAggregate
+from health_capture import capture_internal_health
+from validators.health import HealthAggregate
 
 
 def inspect_internal_health() -> HealthAggregate:
