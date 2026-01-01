@@ -1,0 +1,5 @@
+Incident: powerloss #001
+Time: 2026-01-01T18:50:30Z
+Verdict: OK
+Failed domains: none
+Canonical: incident_powerloss_001_2026-01-01T18-50-30Z.txt

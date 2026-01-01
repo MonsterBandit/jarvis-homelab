@@ -1,0 +1,7 @@
+final_verdict: OK
+event_type: powerloss
+incident_sequence: 001
+incident_uuid: 7f7148e3-6ac2-4df8-984d-51c24c7016a1
+shutdown_started_at_utc: 2026-01-01T18:50:30Z
+canonical_incident: incident_powerloss_001_2026-01-01T18-50-30Z.txt
+canonical_summary: incident_powerloss_001_2026-01-01T18-50-30Z.summary.txt

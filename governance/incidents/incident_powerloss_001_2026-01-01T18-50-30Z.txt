@@ -1,0 +1,33 @@
+--- INCIDENT METADATA ---
+schema_version: 1
+incident_uuid: 7f7148e3-6ac2-4df8-984d-51c24c7016a1
+incident_sequence: 001
+event_type: powerloss
+detected_at_utc: 2026-01-01T18:50:00Z
+shutdown_started_at_utc: 2026-01-01T18:50:30Z
+brownout_grace_s: 30
+brownout_observed_s: 12
+shutdown_mode: state_budgeted
+shutdown_order: ha_vm,isac,infra
+backup_mode: tiered
+backup_threshold_enforced: true
+backup_tiers_enabled: tier0,tier1
+emergency_backup_allowed: true
+recovery_trigger: auto_on_boot
+recovery_blocking: false
+recovery_scope: full
+final_verdict: OK
+failed_domains: none
+previous_incident_uuid: none
+--- END METADATA ---
+
+TEST INCIDENT — IRR INITIAL EMIT
+
+This is a synthetic incident created to validate end-to-end IRR incident
+emission, immutability guarantees, and STATUS_CURRENT update behavior.
+
+No real power event occurred.
+No services were interrupted.
+No recovery actions were taken.
+
+This incident exists solely to confirm correctness of the IRR incident writer.

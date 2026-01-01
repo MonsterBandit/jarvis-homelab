@@ -55,6 +55,9 @@ from services.mealplanner import router as mealplanner_context_router
 from alice_preview_router import router as alice_router
 from health_capture import capture_internal_health
 from system_health_capture import capture_system_health
+from services.irr_ups import router as irr_router
+from services.irr_narrative import router as irr_narrative_router
+
 
 
 # ----------------------------
@@ -3131,4 +3134,14 @@ app.include_router(recipe_analyzer_router)
 app.include_router(recipe_mappings_router)
 
 app.include_router(mealplans_router, prefix="/mealplans", tags=["mealplans"])
+
+app.include_router(
+    irr_router,
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+
+app.include_router(
+    irr_narrative_router,
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
 

@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+"""
+IRR Incident Writer (host-only)
+
+Phase: CLI parsing + strict validation + optional file emission
+
+Locked behavior:
+- Core schema is fixed and required.
+- Optional extensions must be prefixed with 'ext_'.
+- Hard-fail on any missing/invalid core field.
+- Timestamps must be strict UTC ISO: YYYY-MM-DDTHH:MM:SSZ
+- incident_sequence auto-assigned by scanning /opt/jarvis/governance/incidents/ (read-only).
+- event_type is a fixed vocabulary.
+- failed_domains strictly validated against fixed vocabulary.
+- Narrative optional: --narrative-file, else stdin (if piped), else placeholder line.
+
+File emission rules:
+- Default is NO writes.
+- Writes only when --emit is provided.
+- Incident + summary + heartbeat artifacts are immutable (no overwrite; chmod 0444).
+- STATUS_CURRENT is the only mutable governance file (atomic rewrite; chmod 0644).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Dict, Final, FrozenSet, List, Optional, Tuple
+
+
+# ----------------------------
+# Canonical paths (locked)
+# ----------------------------
+GOV_ROOT: Final[str] = "/opt/jarvis/governance"
+INCIDENTS_DIR: Final[str] = f"{GOV_ROOT}/incidents"
+STATUS_CURRENT_PATH: Final[str] = f"{GOV_ROOT}/STATUS_CURRENT"
+
+
+# ----------------------------
+# Naming conventions (locked)
+# ----------------------------
+INCIDENT_FILENAME_FMT: Final[str] = "incident_{event_type}_{sequence}_{ts_utc}Z.txt"
+INCIDENT_SUMMARY_SUFFIX: Final[str] = ".summary.txt"
+HEARTBEAT_FILENAME_FMT: Final[str] = "heartbeat_{date_utc}Z.txt"
+
+
+# ----------------------------
+# Schema: core required header keys (locked v1)
+# ----------------------------
+SCHEMA_VERSION: Final[int] = 1
+
+CORE_KEYS_ORDERED: Final[Tuple[str, ...]] = (
+    "schema_version",
+    "incident_uuid",
+    "incident_sequence",
+    "event_type",
+    "detected_at_utc",
+    "shutdown_started_at_utc",
+    "brownout_grace_s",
+    "brownout_observed_s",
+    "shutdown_mode",
+    "shutdown_order",
+    "backup_mode",
+    "backup_threshold_enforced",
+    "backup_tiers_enabled",
+    "emergency_backup_allowed",
+    "recovery_trigger",
+    "recovery_blocking",
+    "recovery_scope",
+    "final_verdict",
+    "failed_domains",
+    "previous_incident_uuid",
+)
+
+CORE_KEYS: Final[FrozenSet[str]] = frozenset(CORE_KEYS_ORDERED)
+
+FINAL_VERDICTS: Final[FrozenSet[str]] = frozenset({"OK", "WARN", "FAIL"})
+FAILED_DOMAIN_VOCAB: Final[FrozenSet[str]] = frozenset(
+    {"none", "infra", "isac", "ha", "arr", "backup", "network"}
+)
+
+EXT_PREFIX: Final[str] = "ext_"
+
+# Fixed event vocabulary (locked v1)
+EVENT_TYPES: Final[FrozenSet[str]] = frozenset({"powerloss", "heartbeat", "recovery"})
+
+# Strict timestamp: 2026-01-01T03:14:22Z
+TS_RE: Final[re.Pattern[str]] = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+# For incident_sequence scanning
+INCIDENT_SEQ_RE_BY_TYPE: Final[Dict[str, re.Pattern[str]]] = {
+    et: re.compile(rf"^incident_{re.escape(et)}_(\d+)_.*Z\.txt$")
+    for et in EVENT_TYPES
+}
+
+# Locked defaults / choices (current design)
+SHUTDOWN_MODES: Final[FrozenSet[str]] = frozenset({"state_budgeted"})
+SHUTDOWN_ORDER_LOCKED: Final[str] = "ha_vm,isac,infra"
+BACKUP_MODES: Final[FrozenSet[str]] = frozenset({"tiered"})
+RECOVERY_TRIGGERS: Final[FrozenSet[str]] = frozenset({"auto_on_boot"})
+RECOVERY_SCOPES: Final[FrozenSet[str]] = frozenset({"full"})
+
+
+@dataclass(frozen=True)
+class Schema:
+    version: int = SCHEMA_VERSION
+    core_keys: FrozenSet[str] = CORE_KEYS
+    final_verdicts: FrozenSet[str] = FINAL_VERDICTS
+    failed_domain_vocab: FrozenSet[str] = FAILED_DOMAIN_VOCAB
+    ext_prefix: str = EXT_PREFIX
+    event_types: FrozenSet[str] = EVENT_TYPES
+
+
+SCHEMA: Final[Schema] = Schema()
+
+
+# ----------------------------
+# Helpers (validation + IO)
+# ----------------------------
+def die(msg: str, code: int = 2) -> None:
+    print(f"ERROR: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def ensure_dir(path: str) -> None:
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception as e:
+        die(f"failed to ensure dir {path}: {e}")
+
+
+def atomic_write_text(path: str, content: str, mode: int, forbid_overwrite: bool) -> None:
+    """
+    Atomic-ish write:
+    - If forbid_overwrite=True, fail if target exists.
+    - Write to temp file in same directory, fsync, then rename into place.
+    - chmod to requested mode after rename.
+    """
+    d = os.path.dirname(path) or "."
+    ensure_dir(d)
+
+    if forbid_overwrite and os.path.exists(path):
+        die(f"refusing to overwrite immutable artifact: {path}")
+
+    tmp = f"{path}.tmp.{uuid.uuid4()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+        # If someone created target after our pre-check, catch it here.
+        if forbid_overwrite and os.path.exists(path):
+            os.remove(tmp)
+            die(f"refusing to overwrite immutable artifact: {path}")
+
+        os.replace(tmp, path)
+        os.chmod(path, mode)
+    except FileNotFoundError as e:
+        die(f"write failed (missing path?): {e}")
+    except PermissionError as e:
+        die(f"permission denied writing {path}: {e}")
+    except Exception as e:
+        die(f"write failed for {path}: {e}")
+    finally:
+        # If tmp still exists, clean it up.
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def parse_utc_ts(ts: str) -> datetime:
+    if not TS_RE.match(ts):
+        die(f"timestamp must be strict UTC ISO like 2026-01-01T03:14:22Z (got: {ts})")
+    try:
+        dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return dt
+    except Exception as e:
+        die(f"failed to parse timestamp {ts}: {e}")
+        raise
+
+
+def parse_bool(s: str) -> bool:
+    v = s.strip().lower()
+    if v in {"true", "1", "yes", "y"}:
+        return True
+    if v in {"false", "0", "no", "n"}:
+        return False
+    die(f"boolean must be true/false (got: {s})")
+    raise
+
+
+def parse_csv(s: str) -> List[str]:
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if not parts:
+        return []
+    return parts
+
+
+def validate_event_type(event_type: str) -> None:
+    if event_type not in SCHEMA.event_types:
+        die(f"event_type must be one of {sorted(SCHEMA.event_types)} (got: {event_type})")
+
+
+def validate_failed_domains(value: str) -> List[str]:
+    parts = parse_csv(value)
+    if not parts:
+        die("failed_domains cannot be empty (use 'none' or a comma list)")
+    if parts == ["none"]:
+        return parts
+    if "none" in parts and len(parts) > 1:
+        die("failed_domains cannot mix 'none' with other domains")
+    for p in parts:
+        if p not in FAILED_DOMAIN_VOCAB:
+            die(f"failed_domains contains invalid value '{p}'. Allowed: {sorted(FAILED_DOMAIN_VOCAB)}")
+    return parts
+
+
+def validate_ext(ext_pairs: List[str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for pair in ext_pairs:
+        if "=" not in pair:
+            die(f"--ext must be key=value (got: {pair})")
+        k, v = pair.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if not k.startswith(EXT_PREFIX):
+            die(f"extension keys must start with '{EXT_PREFIX}' (got: {k})")
+        if not k or k == EXT_PREFIX:
+            die("invalid extension key")
+        if k in out:
+            die(f"duplicate extension key: {k}")
+        out[k] = v
+    return out
+
+
+def validate_uuid_or_none(value: str, field_name: str) -> None:
+    if value == "none":
+        return
+    try:
+        uuid.UUID(value)
+    except Exception:
+        die(f"{field_name} must be a UUID or 'none' (got: {value})")
+
+
+def next_sequence_for_event(event_type: str) -> int:
+    """
+    Auto-assign next incident sequence by scanning INCIDENTS_DIR.
+    Read-only operation.
+    """
+    if not os.path.isdir(INCIDENTS_DIR):
+        return 1
+
+    pat = INCIDENT_SEQ_RE_BY_TYPE[event_type]
+    max_seen = 0
+    try:
+        for name in os.listdir(INCIDENTS_DIR):
+            m = pat.match(name)
+            if not m:
+                continue
+            seq = int(m.group(1))
+            if seq > max_seen:
+                max_seen = seq
+    except PermissionError as e:
+        die(f"permission error scanning {INCIDENTS_DIR}: {e}")
+    except Exception as e:
+        die(f"error scanning {INCIDENTS_DIR}: {e}")
+
+    return max_seen + 1
+
+
+def read_narrative(narrative_file: Optional[str]) -> str:
+    if narrative_file:
+        try:
+            with open(narrative_file, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+            return text if text else "Narrative: No narrative provided."
+        except Exception as e:
+            die(f"failed to read narrative file: {e}")
+
+    if not sys.stdin.isatty():
+        text = sys.stdin.read().strip()
+        return text if text else "Narrative: No narrative provided."
+
+    return "Narrative: No narrative provided."
+
+
+def format_header(core: Dict[str, str], ext: Dict[str, str]) -> str:
+    lines: List[str] = []
+    lines.append("--- INCIDENT METADATA ---")
+    for k in CORE_KEYS_ORDERED:
+        if k not in core:
+            die(f"internal error: missing core key during formatting: {k}")
+        lines.append(f"{k}: {core[k]}")
+    # extensions in sorted order for determinism
+    for k in sorted(ext.keys()):
+        lines.append(f"{k}: {ext[k]}")
+    lines.append("--- END METADATA ---")
+    return "\n".join(lines)
+
+
+# ----------------------------
+# CLI
+# ----------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="irr-incident", add_help=True)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("create", help="Create incident artifacts (default validate-only; add --emit to write)")
+    c.add_argument("--emit", action="store_true", help="Actually write artifacts and update STATUS_CURRENT")
+
+    c.add_argument("--event-type", required=True, choices=sorted(EVENT_TYPES))
+    c.add_argument("--detected-at-utc", required=True, help="YYYY-MM-DDTHH:MM:SSZ")
+    c.add_argument("--shutdown-started-at-utc", required=True, help="YYYY-MM-DDTHH:MM:SSZ")
+    c.add_argument("--brownout-grace-s", required=True, type=int)
+    c.add_argument("--brownout-observed-s", required=True, type=int)
+
+    c.add_argument("--shutdown-mode", required=True, choices=sorted(SHUTDOWN_MODES))
+    c.add_argument("--shutdown-order", required=True, help=f"locked: {SHUTDOWN_ORDER_LOCKED}")
+
+    c.add_argument("--backup-mode", required=True, choices=sorted(BACKUP_MODES))
+    c.add_argument("--backup-threshold-enforced", required=True, type=str)
+    c.add_argument("--backup-tiers-enabled", required=True, help="csv list like tier0,tier1,tier2")
+    c.add_argument("--emergency-backup-allowed", required=True, type=str)
+
+    c.add_argument("--recovery-trigger", required=True, choices=sorted(RECOVERY_TRIGGERS))
+    c.add_argument("--recovery-blocking", required=True, type=str)
+    c.add_argument("--recovery-scope", required=True, choices=sorted(RECOVERY_SCOPES))
+
+    c.add_argument("--final-verdict", required=True, choices=sorted(FINAL_VERDICTS))
+    c.add_argument("--failed-domains", required=True, help="none or csv: infra,isac,ha,arr,backup,network")
+    c.add_argument("--previous-incident-uuid", required=True, help="UUID or 'none'")
+
+    c.add_argument("--narrative-file", required=False)
+    c.add_argument("--ext", action="append", default=[], help="Optional extensions, repeatable: ext_key=value")
+    c.add_argument("--incident-uuid", required=False, help="Override generated incident_uuid (testing only)")
+
+    h = sub.add_parser("heartbeat", help="Create heartbeat artifact (default validate-only; add --emit to write)")
+    h.add_argument("--emit", action="store_true", help="Actually write artifact (immutable)")
+    h.add_argument("--date-utc", required=True, help="YYYY-MM-DD")
+    h.add_argument("--final-verdict", required=True, choices=sorted(FINAL_VERDICTS))
+    h.add_argument("--failed-domains", required=True)
+    h.add_argument("--narrative-file", required=False)
+    h.add_argument("--ext", action="append", default=[], help="Optional extensions, repeatable: ext_key=value")
+
+    return p
+
+
+def cmd_create(args: argparse.Namespace) -> None:
+    validate_event_type(args.event_type)
+    detected = parse_utc_ts(args.detected_at_utc)
+    shutdown_started = parse_utc_ts(args.shutdown_started_at_utc)
+
+    if shutdown_started < detected:
+        die("shutdown_started_at_utc cannot be earlier than detected_at_utc")
+
+    if args.brownout_grace_s < 0 or args.brownout_observed_s < 0:
+        die("brownout seconds must be non-negative")
+    if args.brownout_observed_s > args.brownout_grace_s:
+        die("brownout_observed_s cannot exceed brownout_grace_s")
+
+    if args.shutdown_order.strip() != SHUTDOWN_ORDER_LOCKED:
+        die(f"shutdown_order must be exactly '{SHUTDOWN_ORDER_LOCKED}' for v1")
+
+    backup_threshold_enforced = parse_bool(args.backup_threshold_enforced)
+    emergency_backup_allowed = parse_bool(args.emergency_backup_allowed)
+    recovery_blocking = parse_bool(args.recovery_blocking)
+
+    failed_domains_parts = validate_failed_domains(args.failed_domains)
+    validate_uuid_or_none(args.previous_incident_uuid, "previous_incident_uuid")
+
+    seq = next_sequence_for_event(args.event_type)
+
+    incident_uuid_val = args.incident_uuid.strip() if args.incident_uuid else str(uuid.uuid4())
+    validate_uuid_or_none(incident_uuid_val, "incident_uuid")
+
+    ext = validate_ext(args.ext)
+    narrative = read_narrative(args.narrative_file)
+
+    ts_utc_for_filename = shutdown_started.strftime("%Y-%m-%dT%H-%M-%S")
+    seq_str = f"{seq:03d}"
+
+    incident_name = INCIDENT_FILENAME_FMT.format(event_type=args.event_type, sequence=seq_str, ts_utc=ts_utc_for_filename)
+    summary_name = incident_name.replace(".txt", "") + INCIDENT_SUMMARY_SUFFIX
+
+    incident_path = f"{INCIDENTS_DIR}/{incident_name}"
+    summary_path = f"{INCIDENTS_DIR}/{summary_name}"
+
+    core: Dict[str, str] = {
+        "schema_version": str(SCHEMA_VERSION),
+        "incident_uuid": incident_uuid_val,
+        "incident_sequence": seq_str,
+        "event_type": args.event_type,
+        "detected_at_utc": args.detected_at_utc,
+        "shutdown_started_at_utc": args.shutdown_started_at_utc,
+        "brownout_grace_s": str(args.brownout_grace_s),
+        "brownout_observed_s": str(args.brownout_observed_s),
+        "shutdown_mode": args.shutdown_mode,
+        "shutdown_order": args.shutdown_order.strip(),
+        "backup_mode": args.backup_mode,
+        "backup_threshold_enforced": "true" if backup_threshold_enforced else "false",
+        "backup_tiers_enabled": args.backup_tiers_enabled.strip(),
+        "emergency_backup_allowed": "true" if emergency_backup_allowed else "false",
+        "recovery_trigger": args.recovery_trigger,
+        "recovery_blocking": "true" if recovery_blocking else "false",
+        "recovery_scope": args.recovery_scope,
+        "final_verdict": args.final_verdict,
+        "failed_domains": ",".join(failed_domains_parts),
+        "previous_incident_uuid": args.previous_incident_uuid,
+    }
+
+    header = format_header(core, ext)
+    full_text = header + "\n\n" + narrative.strip() + "\n"
+
+    # Summary: small 5-10 lines max
+    summary_lines = [
+        f"Incident: {args.event_type} #{seq_str}",
+        f"Time: {args.shutdown_started_at_utc}",
+        f"Verdict: {args.final_verdict}",
+        f"Failed domains: {core['failed_domains']}",
+        f"Canonical: {incident_name}",
+    ]
+    summary_text = "\n".join(summary_lines) + "\n"
+
+    print("VALIDATED OK")
+    print(f"would_write_incident: {incident_path}")
+    print(f"would_write_summary:  {summary_path}")
+    print(f"would_update_status_current: {STATUS_CURRENT_PATH}")
+    print(f"emit: {args.emit}")
+
+    if not args.emit:
+        print("NOTE: no file writes performed (add --emit to write).")
+        return
+
+    # Emit artifacts (immutable) + status pointer (mutable)
+    ensure_dir(INCIDENTS_DIR)
+
+    atomic_write_text(incident_path, full_text.rstrip("\n"), mode=0o444, forbid_overwrite=True)
+    atomic_write_text(summary_path, summary_text.rstrip("\n"), mode=0o444, forbid_overwrite=True)
+
+    status_current = "\n".join(
+        [
+            f"final_verdict: {args.final_verdict}",
+            f"event_type: {args.event_type}",
+            f"incident_sequence: {seq_str}",
+            f"incident_uuid: {incident_uuid_val}",
+            f"shutdown_started_at_utc: {args.shutdown_started_at_utc}",
+            f"canonical_incident: {incident_name}",
+            f"canonical_summary: {summary_name}",
+        ]
+    )
+    atomic_write_text(STATUS_CURRENT_PATH, status_current.rstrip("\n"), mode=0o644, forbid_overwrite=False)
+
+    print("EMIT OK")
+
+
+def cmd_heartbeat(args: argparse.Namespace) -> None:
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", args.date_utc):
+        die("date_utc must be YYYY-MM-DD")
+    try:
+        datetime.strptime(args.date_utc, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except Exception as e:
+        die(f"invalid date_utc: {e}")
+
+    validate_failed_domains(args.failed_domains)
+    ext = validate_ext(args.ext)
+    narrative = read_narrative(args.narrative_file)
+
+    name = HEARTBEAT_FILENAME_FMT.format(date_utc=args.date_utc)
+    path = f"{INCIDENTS_DIR}/{name}"
+
+    core = {
+        "schema_version": str(SCHEMA_VERSION),
+        "event_type": "heartbeat",
+        "date_utc": args.date_utc,
+        "final_verdict": args.final_verdict,
+        "failed_domains": args.failed_domains.strip(),
+    }
+
+    lines = ["--- HEARTBEAT METADATA ---"]
+    for k in sorted(core.keys()):
+        lines.append(f"{k}: {core[k]}")
+    for k in sorted(ext.keys()):
+        lines.append(f"{k}: {ext[k]}")
+    lines.append("--- END METADATA ---")
+    hb_text = "\n".join(lines) + "\n\n" + narrative.strip() + "\n"
+
+    print("VALIDATED OK")
+    print(f"would_write_heartbeat: {path}")
+    print(f"emit: {args.emit}")
+
+    if not args.emit:
+        print("NOTE: no file writes performed (add --emit to write).")
+        return
+
+    ensure_dir(INCIDENTS_DIR)
+    atomic_write_text(path, hb_text.rstrip("\n"), mode=0o444, forbid_overwrite=True)
+    print("EMIT OK")
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.cmd == "create":
+        cmd_create(args)
+    elif args.cmd == "heartbeat":
+        cmd_heartbeat(args)
+    else:
+        die("unknown command")
+
+
+if __name__ == "__main__":
+    main()

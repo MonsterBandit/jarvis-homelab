@@ -29,3 +29,5 @@ services:
     networks:
       - jarvis_net
       - compose_default
+    volumes:
+      - /var/tmp/irr:/irr:ro

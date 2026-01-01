@@ -1,0 +1,15 @@
+--- HEARTBEAT METADATA ---
+date_utc: 2026-01-01
+event_type: heartbeat
+failed_domains: none
+final_verdict: OK
+schema_version: 1
+--- END METADATA ---
+
+IRR HEARTBEAT — INITIAL
+
+Synthetic heartbeat emitted to validate heartbeat artifact creation,
+immutability, and STATUS_CURRENT update behavior.
+
+All monitored domains nominal.
+No failures observed.
