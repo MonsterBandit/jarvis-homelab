@@ -1,11 +1,13 @@
+import os
 import json
 from pathlib import Path
 from typing import Dict, Any
 
 
 FINANCE_SNAPSHOT_PATH = Path(
-    "/opt/jarvis/brain-data/finance/snapshots/latest.json"
+    os.getenv("FINANCE_SNAPSHOT_PATH", "/app/data/finance/snapshots/latest.json")
 )
+
 
 
 class FinanceSnapshotError(Exception):
