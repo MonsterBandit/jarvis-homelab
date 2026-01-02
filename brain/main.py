@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import socket
 import sqlite3
@@ -8,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Literal
+
 
 import httpx
 import psutil
@@ -757,6 +759,84 @@ def finance_summary() -> Dict[str, Any]:
             status_code=500,
             detail=f"Finance summary error: {exc}",
         ) from exc
+
+
+@finance_router.get("/health")
+def finance_health() -> Dict[str, Any]:
+    """
+    Admin-only finance health endpoint.
+    Read-only diagnostics for snapshot presence, symlink integrity, freshness, and JSON validity.
+    No live API calls. No writes.
+    """
+    snapshot_path = Path("/app/data/finance/snapshots/latest.json")
+    now_utc = datetime.now(timezone.utc)
+
+    exists = snapshot_path.exists()
+    is_symlink = snapshot_path.is_symlink()
+
+    resolved_path = snapshot_path.resolve(strict=False) if is_symlink else snapshot_path
+    resolved_exists = resolved_path.exists()
+
+    if not exists:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Finance snapshot not found at {snapshot_path}",
+        )
+
+    # Stat the actual file we can read (prefer resolved target for symlink)
+    stat_path = resolved_path if resolved_exists else snapshot_path
+    st = stat_path.stat()
+    mtime_utc = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+    age_seconds = int((now_utc - mtime_utc).total_seconds())
+
+    json_ok = False
+    json_error: Optional[str] = None
+    top_level_type: Optional[str] = None
+    top_level_keys: Optional[int] = None
+
+    try:
+        raw = stat_path.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+        json_ok = True
+        top_level_type = type(parsed).__name__
+        if isinstance(parsed, dict):
+            top_level_keys = len(parsed.keys())
+    except Exception as exc:  # noqa: BLE001
+        json_ok = False
+        json_error = str(exc)
+
+    status = "ok"
+    notes: List[str] = []
+
+    if is_symlink and not resolved_exists:
+        status = "degraded"
+        notes.append("latest.json is a symlink but the resolved target does not exist (broken symlink).")
+
+    if not json_ok:
+        status = "degraded"
+        notes.append("snapshot file exists but JSON failed to parse.")
+
+    return {
+        "status": status,
+        "captured_at_utc": now_utc.isoformat(),
+        "snapshot": {
+            "path": str(snapshot_path),
+            "exists": exists,
+            "is_symlink": is_symlink,
+            "resolved_path": str(resolved_path) if is_symlink else None,
+            "resolved_exists": resolved_exists if is_symlink else None,
+            "size_bytes": int(st.st_size),
+            "mtime_utc": mtime_utc.isoformat(),
+            "age_seconds": age_seconds,
+            "json_ok": json_ok,
+            "json_error": json_error,
+            "top_level_type": top_level_type,
+            "top_level_keys": top_level_keys,
+        },
+        "notes": notes,
+    }
+
+        
 
 
 # ---------------------------------------------------------
