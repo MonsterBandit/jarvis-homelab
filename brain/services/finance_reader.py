@@ -5,6 +5,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
 
 
+# Finance behavior contract:
+# See services/finance_contract.md (Phase 7, read-only, snapshot-backed)
+
+
 FINANCE_SNAPSHOT_PATH = Path(
     os.getenv("FINANCE_SNAPSHOT_PATH", "/app/data/finance/snapshots/latest.json")
 )
