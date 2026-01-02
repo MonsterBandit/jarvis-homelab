@@ -59,7 +59,7 @@ from health_capture import capture_internal_health
 from system_health_capture import capture_system_health
 from services.irr_ups import router as irr_router
 from services.irr_narrative import router as irr_narrative_router
-from services.finance_reader import summarize_finances, FinanceSnapshotError
+from services.finance_reader import summarize_finances, list_transactions, FinanceSnapshotError
 
 
 # ----------------------------
@@ -758,6 +758,41 @@ def finance_summary() -> Dict[str, Any]:
         raise HTTPException(
             status_code=500,
             detail=f"Finance summary error: {exc}",
+        ) from exc
+
+
+@finance_router.get("/transactions")
+def finance_transactions(
+    days: int = Query(
+        default=30,
+        ge=1,
+        le=365,
+        description="Window size in days (UTC). Default 30. Max 365.",
+    ),
+    limit: int = Query(
+        default=200,
+        ge=1,
+        le=1000,
+        description="Max items to return (after filtering). Default 200. Max 1000.",
+    ),
+    offset: int = Query(
+        default=0,
+        ge=0,
+        description="Pagination offset (after filtering + sorting). Default 0.",
+    ),
+) -> Dict[str, Any]:
+    """
+    READ-ONLY transaction listing derived from the local snapshot file.
+    No live API calls, no writes, no mutations.
+    """
+    try:
+        return list_transactions(days=days, limit=limit, offset=offset)
+    except FinanceSnapshotError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"Finance transactions error: {exc}",
         ) from exc
 
 
