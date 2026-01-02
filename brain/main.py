@@ -57,7 +57,7 @@ from health_capture import capture_internal_health
 from system_health_capture import capture_system_health
 from services.irr_ups import router as irr_router
 from services.irr_narrative import router as irr_narrative_router
-
+from services.finance_reader import summarize_finances, FinanceSnapshotError
 
 
 # ----------------------------
@@ -727,6 +727,36 @@ def require_admin_if_configured(
 
     if x_isac_admin_key != configured:
         raise HTTPException(status_code=401, detail="Invalid or missing admin key")
+
+
+# ---------------------------------------------------------
+# Phase 7 — Finance (Firefly) READ-ONLY snapshot router
+# ---------------------------------------------------------
+finance_router = APIRouter(
+    prefix="/finance",
+    tags=["finance"],
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+
+
+@finance_router.get("/summary")
+def finance_summary() -> Dict[str, Any]:
+    """
+    READ-ONLY finance summary derived from the local snapshot file.
+    No live API calls, no writes, no mutations.
+    """
+    try:
+        return summarize_finances()
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Finance snapshot not found: {exc}",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"Finance summary error: {exc}",
+        ) from exc
 
 
 # ---------------------------------------------------------
@@ -3122,6 +3152,8 @@ app.include_router(alice_router)
 app.include_router(ha_router)
 app.include_router(calendar_router)
 app.include_router(grocy_router)
+app.include_router(finance_router)
+
 
 # Meal planner (single source of truth: services/mealplanner.py)
 app.include_router(mealplanner_context_router)
