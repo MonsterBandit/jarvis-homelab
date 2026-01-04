@@ -55,11 +55,14 @@ from services.mealplans import router as mealplans_router
 from services.mealplanner import router as mealplanner_context_router
 # Alice (Phase 8) — read-only preview endpoint (NOT wired into /ask)
 from alice_preview_router import router as alice_router
+from alice.memory_api import router as alice_memory_router
+
 from health_capture import capture_internal_health
 from system_health_capture import capture_system_health
 from services.irr_ups import router as irr_router
 from services.irr_narrative import router as irr_narrative_router
 from services.finance_reader import summarize_finances, list_transactions, FinanceSnapshotError
+
 
 
 # ----------------------------
@@ -3263,6 +3266,7 @@ app.include_router(health_router)
 
 # Alice (Phase 8) — read-only preview endpoint
 app.include_router(alice_router)
+app.include_router(alice_memory_router)
 
 app.include_router(ha_router)
 app.include_router(calendar_router)
