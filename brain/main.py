@@ -56,6 +56,7 @@ from services.mealplanner import router as mealplanner_context_router
 # Alice (Phase 8) — read-only preview endpoint (NOT wired into /ask)
 from alice_preview_router import router as alice_router
 from alice.memory_api import router as alice_memory_router
+from alice.name_resolution import resolve_alias_to_concept
 
 from health_capture import capture_internal_health
 from system_health_capture import capture_system_health
@@ -654,10 +655,11 @@ def create_model_client() -> GeminiModelClient | OpenAICompatibleClient:
                 "for the openai-compatible provider."
             )
         return OpenAICompatibleClient(
-            OPENAI_COMPATIBLE_API_BASE,
-            OPENAI_COMPATIBLE_API_KEY,
-            JARVIS_LLM_MODEL,
+            api_base=OPENAI_COMPATIBLE_API_BASE,
+            api_key=OPENAI_COMPATIBLE_API_KEY,
+            default_model=JARVIS_LLM_MODEL,
         )
+
 
     if provider == "gemini":
         if not GEMINI_API_KEY:
@@ -3209,10 +3211,64 @@ async def ask_jarvis(body: AskRequest, request: Request) -> AskResponse:
     )
 
     conversation_context = request.headers.get("X-Jarvis-Context", "")
+    
+    # Phase 8 (Unified): read-only name resolution (Option A + B)
+    # - Single resolution pass
+    # - No writes, no learning, no behavior changes
+    hidden_resolution_context: Optional[str] = None
+
+    try:
+        nr_user_id = request.headers.get("X-ISAC-USER-ID")
+        nr_result = None
+
+        if nr_user_id:
+            nr_result = resolve_alias_to_concept(
+                text=body.message,
+                user_id=nr_user_id,
+            )
+
+            # Option A: logging only
+            if nr_result:
+                print(
+                    "[ASK][NAME_RESOLUTION] match "
+                    f"user_id={nr_user_id!r} "
+                    f"alias_id={nr_result.get('alias_id')} "
+                    f"concept_id={nr_result.get('concept_id')} "
+                    f"concept_key={nr_result.get('concept_key')!r} "
+                    f"preferred_name={nr_result.get('preferred_name')!r} "
+                    f"confidence={nr_result.get('confidence')} "
+                    f"source={nr_result.get('source')!r}"
+                )
+
+                # Option B: hidden advisory context
+                hidden_resolution_context = (
+                    "Internal note (read-only): The user's message exactly matches a known "
+                    "user-specific alias. This may refer to concept "
+                    f"'{nr_result.get('concept_key')}' "
+                    f"(preferred name: '{nr_result.get('preferred_name')}'). "
+                    "Treat this as contextual awareness only. "
+                    "Do not assume correctness and do not state this explicitly unless "
+                    "the user naturally confirms or asks."
+                )
+            else:
+                print(
+                    "[ASK][NAME_RESOLUTION] no_match "
+                    f"user_id={nr_user_id!r} "
+                    f"text={body.message!r}"
+                )
+        else:
+            print("[ASK][NAME_RESOLUTION] skipped missing X-ISAC-USER-ID")
+
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ASK][NAME_RESOLUTION] error: {exc}")
 
     messages = []
     if conversation_context:
         messages.append({"role": "system", "content": conversation_context})
+
+    if hidden_resolution_context:
+        messages.append({"role": "system", "content": hidden_resolution_context})
+
     messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": body.message})
 
@@ -3255,6 +3311,22 @@ async def model_client_error_handler(
     return JSONResponse(
         status_code=500,
         content={"detail": f"Model client error: {exc}"},
+    )
+
+@app.exception_handler(sqlite3.IntegrityError)
+async def sqlite_integrity_error_handler(
+    request: Request, exc: sqlite3.IntegrityError
+) -> JSONResponse:
+    # Common case for our memory system: idempotent-ish seeds collide with UNIQUE constraints.
+    # Return a clean 409 instead of a scary 500.
+    msg = str(exc)
+    detail = "Conflict: integrity constraint violation."
+    # Keep it helpful but not overly leaky.
+    if "UNIQUE" in msg.upper():
+        detail = "Conflict: item already exists (unique constraint)."
+    return JSONResponse(
+        status_code=409,
+        content={"detail": detail},
     )
 
 
