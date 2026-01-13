@@ -1,0 +1,14 @@
+services:
+  jarvis-runner:
+    container_name: jarvis-runner
+    build:
+      context: ./runner
+    restart: unless-stopped
+    volumes:
+      - /opt/jarvis:/opt/jarvis:ro
+    networks:
+      - jarvis_net
+
+networks:
+  jarvis_net:
+    external: true

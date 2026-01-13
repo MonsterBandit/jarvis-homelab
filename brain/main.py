@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import base64
+import hashlib
+import tempfile
 import socket
 import sqlite3
 import time
+import secrets
+import hmac
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -63,8 +68,160 @@ from system_health_capture import capture_system_health
 from services.irr_ups import router as irr_router
 from services.irr_narrative import router as irr_narrative_router
 from services.finance_reader import summarize_finances, list_transactions, FinanceSnapshotError
+from services.task_ledger import create_task, add_step, add_artifact
 
 
+
+# ---------------------------------------------------------
+# Escape Hatch v2 — Evidence & Environment Assumptions
+# (LOCKED: v2 only; no templates, no diff-apply yet)
+# ---------------------------------------------------------
+
+class FailureClass(str):
+    """Failure classification enum (string-friendly)."""
+    TRANSIENT = "transient"
+    CONFIG = "config"
+    GUARDRAIL = "guardrail"
+    VERIFY = "verify"
+    EXECUTION = "execution"
+    UNKNOWN = "unknown"
+
+
+class ExecutionLockError(RuntimeError):
+    pass
+
+
+class ExecutionLock:
+    """
+    Cross-process single-execution concurrency guard.
+
+    Uses an atomic lockfile create (O_EXCL). This works across multiple workers.
+    The lock is held for the duration of any *execute* path (e.g., /tasks/*/resume).
+    """
+
+    def __init__(self, lock_path: str = "/app/data/locks/execution.lock") -> None:
+        self.lock_path = lock_path
+        self.fd: Optional[int] = None
+
+    def acquire(self) -> None:
+        Path(self.lock_path).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            payload = {
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "acquired_at_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            os.write(self.fd, json.dumps(payload).encode("utf-8"))
+        except FileExistsError as exc:
+            # Surface helpful context if possible
+            info: Any = None
+            try:
+                info = Path(self.lock_path).read_text(encoding="utf-8")
+            except Exception:
+                info = None
+            raise ExecutionLockError(
+                f"Another execution is already in progress (lock exists at {self.lock_path}). "
+                f"Lock info: {info}"
+            ) from exc
+
+    def release(self) -> None:
+        try:
+            if self.fd is not None:
+                try:
+                    os.close(self.fd)
+                except Exception:
+                    pass
+            self.fd = None
+            try:
+                Path(self.lock_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        finally:
+            self.fd = None
+
+
+def _safe_bool_env(name: str, default: bool) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+ISAC_DRY_RUN_DEFAULT = _safe_bool_env("ISAC_DRY_RUN_DEFAULT", True)
+
+
+def tooling_probe_snapshot() -> Dict[str, Any]:
+    """
+    Gather a deterministic, read-only environment/tooling snapshot.
+    This is the v2 'assumptions artifact' used later by verify templates.
+    """
+    now_utc = datetime.now(timezone.utc).isoformat()
+
+    def which(cmd: str) -> Optional[str]:
+        from shutil import which as _which
+        return _which(cmd)
+
+    # Minimal, practical probes. No network. No runner. No DB writes here.
+    snapshot: Dict[str, Any] = {
+        "captured_at_utc": now_utc,
+        "service": "isac-brain",
+        "db_path": DB_PATH,
+        "runner_base_url": JARVIS_RUNNER_BASE_URL,
+        "python": {
+            "executable": which("python3") or which("python"),
+            "version": ".".join(map(str, tuple(__import__("sys").version_info)[:3])),
+        },
+        "tools": {
+            "curl": which("curl"),
+            "jq": which("jq"),
+            "git": which("git"),
+        },
+        "paths": {
+            "brain_dir_exists": Path("/opt/jarvis/brain").exists(),
+            "ui_index_exists": Path("/opt/jarvis/data/index.html").exists(),
+            "db_file_exists": Path(DB_PATH).exists(),
+        },
+        "env_presence": {
+            # Do not include secrets, only presence.
+            "JARVIS_API_KEY": bool(os.getenv("JARVIS_API_KEY")),
+            "ISAC_ADMIN_PIN": bool(os.getenv("ISAC_ADMIN_PIN")),
+            "ISAC_ADMIN_KEY": bool(os.getenv("ISAC_ADMIN_KEY") or os.getenv("ISAC_ADMIN_API_KEY")),
+            "JARVIS_RUNNER_BASE_URL": bool(os.getenv("JARVIS_RUNNER_BASE_URL")),
+            "HOMEASSISTANT_BASE_URL": bool(os.getenv("HOMEASSISTANT_BASE_URL")),
+            "GROCY_HOME_A_BASE_URL": bool(os.getenv("GROCY_HOME_A_BASE_URL")),
+            "BARCODEBUDDY_BASE_URL": bool(os.getenv("BARCODEBUDDY_BASE_URL")),
+            "FIREFLY_BASE_URL": bool(os.getenv("FIREFLY_BASE_URL")),
+        },
+        "dry_run": {
+            "default": bool(ISAC_DRY_RUN_DEFAULT),
+        },
+    }
+
+    # Optional: cheap system facts (no errors if psutil unavailable)
+    try:
+        snapshot["system"] = {
+            "hostname": socket.gethostname(),
+            "cpu_count_logical": psutil.cpu_count(logical=True),
+            "mem_total_bytes": getattr(psutil.virtual_memory(), "total", None),
+        }
+    except Exception:
+        snapshot["system"] = {"hostname": socket.gethostname()}
+
+    return snapshot
+
+
+def _failure_class_from_exception(exc: Exception) -> str:
+    msg = str(exc).lower()
+    if isinstance(exc, ExecutionLockError):
+        return FailureClass.GUARDRAIL
+    if "not configured" in msg or "missing" in msg:
+        return FailureClass.CONFIG
+    if "timeout" in msg or "unreachable" in msg:
+        return FailureClass.TRANSIENT
+    return FailureClass.EXECUTION
 
 # ----------------------------
 # Environment & configuration
@@ -85,6 +242,22 @@ API_KEY = os.getenv("JARVIS_API_KEY")
 
 HOMEASSISTANT_BASE_URL = os.getenv("HOMEASSISTANT_BASE_URL", "")
 HOMEASSISTANT_TOKEN = os.getenv("HOMEASSISTANT_TOKEN", "")
+
+JARVIS_RUNNER_BASE_URL = os.getenv("JARVIS_RUNNER_BASE_URL", "http://jarvis-runner:8080")
+
+# ----------------------------
+# Alice Admin Unlock (Execution Spine v1.1)
+# ----------------------------
+# PIN unlock issues a short-lived admin token.
+# Browser never needs to store X-ISAC-ADMIN-KEY.
+ISAC_ADMIN_PIN = (os.getenv("ISAC_ADMIN_PIN") or "").replace("\r", "").strip()
+
+try:
+    ISAC_ADMIN_TOKEN_TTL_SECONDS = int(
+        (os.getenv("ISAC_ADMIN_TOKEN_TTL_SECONDS") or "3600").strip()
+    )
+except Exception:
+    ISAC_ADMIN_TOKEN_TTL_SECONDS = 3600
 
 # ----------------------------
 # Database helpers
@@ -211,10 +384,178 @@ def init_db() -> None:
             """
         )
 
+        
+        # --- Escape Hatch v2 additions (evidence, lineage, timing, failures) ---
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS execution_lineage (
+                task_id INTEGER PRIMARY KEY,
+                parent_task_id INTEGER,
+                trigger_reason TEXT,
+                verify_failures INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS execution_timing (
+                task_id INTEGER PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                last_verify_at TEXT,
+                last_verify_ok INTEGER,
+                last_verify_detail TEXT
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS execution_failures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER,
+                step_id INTEGER,
+                failure_class TEXT NOT NULL,
+                message TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
         conn.commit()
     finally:
         conn.close()
 
+
+def _db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def lineage_init(task_id: int, parent_task_id: Optional[int] = None, trigger_reason: Optional[str] = None) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _db_connect()
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO execution_lineage (task_id, parent_task_id, trigger_reason, verify_failures, created_at, updated_at)
+            VALUES (?, ?, ?, COALESCE((SELECT verify_failures FROM execution_lineage WHERE task_id=?), 0), COALESCE((SELECT created_at FROM execution_lineage WHERE task_id=?), ?), ?)
+            """,
+            (task_id, parent_task_id, trigger_reason, task_id, task_id, now, now),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO execution_timing (task_id, created_at)
+            VALUES (?, ?)
+            """,
+            (task_id, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def timing_mark_started(task_id: int) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _db_connect()
+    try:
+        conn.execute(
+            """
+            UPDATE execution_timing
+            SET started_at = COALESCE(started_at, ?)
+            WHERE task_id = ?
+            """,
+            (now, task_id),
+        )
+        conn.execute(
+            """
+            UPDATE execution_lineage
+            SET updated_at = ?
+            WHERE task_id = ?
+            """,
+            (now, task_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def timing_mark_finished(task_id: int) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _db_connect()
+    try:
+        conn.execute(
+            """
+            UPDATE execution_timing
+            SET finished_at = ?
+            WHERE task_id = ?
+            """,
+            (now, task_id),
+        )
+        conn.execute(
+            """
+            UPDATE execution_lineage
+            SET updated_at = ?
+            WHERE task_id = ?
+            """,
+            (now, task_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def failures_record(task_id: int, step_id: Optional[int], failure_class: str, message: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _db_connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO execution_failures (task_id, step_id, failure_class, message, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (task_id, step_id, failure_class, message[:5000], now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def lineage_get_verify_failures(task_id: int) -> int:
+    conn = _db_connect()
+    try:
+        row = conn.execute(
+            "SELECT verify_failures FROM execution_lineage WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+    finally:
+        conn.close()
+
+
+def lineage_inc_verify_failures(task_id: int) -> int:
+    """Increment and return verify_failures for this task's lineage."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _db_connect()
+    try:
+        conn.execute(
+            """
+            UPDATE execution_lineage
+            SET verify_failures = COALESCE(verify_failures, 0) + 1,
+                updated_at = ?
+            WHERE task_id = ?
+            """,
+            (now, task_id),
+        )
+        conn.commit()
+        return lineage_get_verify_failures(task_id)
+    finally:
+        conn.close()
 
 def log_conversation(model: str, user_message: str, jarvis_answer: str) -> None:
     """
@@ -704,37 +1045,164 @@ init_db()
 # ----------------------------
 
 
-def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
+def require_api_key(
+    x_api_key: Optional[str] = Header(default=None),
+    x_isac_readonly_key: Optional[str] = Header(default=None),
+    x_isac_admin_key: Optional[str] = Header(default=None),
+) -> None:
     """
-    Simple header-based API key check. If JARVIS_API_KEY is not set,
-    this becomes a no-op (open access).
+    Unified read auth gate (LOCKED INTENT):
+    - Keeps legacy support: X-API-Key == JARVIS_API_KEY
+    - Adds Alice/ISAC support:
+        X-ISAC-READONLY-KEY == ISAC_READONLY_API_KEY
+        X-ISAC-ADMIN-KEY   == ISAC_ADMIN_API_KEY or ISAC_ADMIN_KEY
+
+    If none of these keys are configured, access is open (no-op).
     """
-    if not API_KEY:
+
+    def _clean(v: Optional[str]) -> str:
+        # Protect against CRLF env values and copy/paste whitespace.
+        return (v or "").replace("\r", "").strip()
+
+    jarvis_key = _clean(API_KEY)
+
+    readonly_cfg = _clean(os.getenv("ISAC_READONLY_API_KEY"))
+    admin_cfg = _clean(os.getenv("ISAC_ADMIN_API_KEY") or os.getenv("ISAC_ADMIN_KEY"))
+
+    # Clean incoming headers too (defensive)
+    x_api_key = _clean(x_api_key)
+    x_isac_readonly_key = _clean(x_isac_readonly_key)
+    x_isac_admin_key = _clean(x_isac_admin_key)
+
+    # If nothing is configured, do not gate.
+    if not jarvis_key and not readonly_cfg and not admin_cfg:
         return
 
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    # Accept any configured key presented via its corresponding header.
+    if jarvis_key and x_api_key == jarvis_key:
+        return
+
+    if readonly_cfg and x_isac_readonly_key == readonly_cfg:
+        return
+
+    if admin_cfg and x_isac_admin_key == admin_cfg:
+        return
+
+    raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 def require_admin_if_configured(
     x_isac_admin_key: Optional[str] = Header(default=None),
+    x_isac_admin_token: Optional[str] = Header(default=None),
 ) -> None:
     """
-    Admin-safe gating for sensitive read-only endpoints.
-    - If ISAC_ADMIN_KEY is not set: no-op (open access).
-    - If ISAC_ADMIN_KEY is set: require X-ISAC-Admin-Key to match.
-    """
-    configured = (
-        os.getenv("ISAC_ADMIN_API_KEY")
-        or os.getenv("ISAC_ADMIN_KEY")
-    )
+    Admin-safe gating for sensitive endpoints.
 
-    if not configured:   
+    Accepted admin proofs (if configured):
+    - X-ISAC-ADMIN-KEY matches ISAC_ADMIN_API_KEY or ISAC_ADMIN_KEY (legacy + emergency)
+    - X-ISAC-ADMIN-TOKEN is a valid, unexpired token issued by POST /auth/admin/unlock
+      (requires ISAC_ADMIN_PIN to be configured)
+
+    If neither an admin key nor a PIN is configured, this gate is open (no-op).
+    """
+
+    def _clean(v: Optional[str]) -> str:
+        return (v or "").replace("\r", "").strip()
+
+    configured_key = _clean(os.getenv("ISAC_ADMIN_API_KEY") or os.getenv("ISAC_ADMIN_KEY"))
+    configured_pin = _clean(ISAC_ADMIN_PIN)
+
+    # If nothing is configured, do not gate.
+    if not configured_key and not configured_pin:
         return
 
-    if x_isac_admin_key != configured:
-        raise HTTPException(status_code=401, detail="Invalid or missing admin key")
+    # 1) Legacy/admin key path (always allowed if configured)
+    if configured_key and _clean(x_isac_admin_key) == configured_key:
+        return
 
+    # 2) Token path (only valid if PIN configured)
+    if configured_pin and _is_valid_admin_token(_clean(x_isac_admin_token)):
+        return
+
+    raise HTTPException(status_code=401, detail="Invalid or missing admin credentials")
+
+# ---------------------------------------------------------
+# Alice Admin Unlock (Execution Spine v1.1)
+# - PIN -> short-lived admin token
+# - Tokens are in-memory (reset on brain restart), session-friendly
+# ---------------------------------------------------------
+
+_ADMIN_TOKENS: Dict[str, float] = {}  # token -> expires_at_epoch_seconds
+
+
+def _cleanup_admin_tokens() -> None:
+    now = time.time()
+    expired = [tok for tok, exp in _ADMIN_TOKENS.items() if exp <= now]
+    for tok in expired:
+        _ADMIN_TOKENS.pop(tok, None)
+
+
+def _issue_admin_token() -> Dict[str, Any]:
+    _cleanup_admin_tokens()
+
+    ttl = int(ISAC_ADMIN_TOKEN_TTL_SECONDS or 3600)
+    if ttl < 60:
+        ttl = 60
+    if ttl > 24 * 3600:
+        ttl = 24 * 3600
+
+    token = secrets.token_urlsafe(32)
+    exp = time.time() + ttl
+    _ADMIN_TOKENS[token] = exp
+
+    exp_dt = datetime.now(timezone.utc) + timedelta(seconds=ttl)
+    return {
+        "token": token,
+        "ttl_seconds": ttl,
+        "expires_at_utc": exp_dt.isoformat(),
+    }
+
+
+def _is_valid_admin_token(token: str) -> bool:
+    if not token:
+        return False
+    _cleanup_admin_tokens()
+    exp = _ADMIN_TOKENS.get(token)
+    if exp is None:
+        return False
+    return exp > time.time()
+
+
+class AdminUnlockRequest(BaseModel):
+    pin: str = Field(..., min_length=1, description="Admin PIN/passphrase (server-side)")
+
+
+@app.post(
+    "/auth/admin/unlock",
+    dependencies=[Depends(require_api_key)],
+)
+def auth_admin_unlock(body: AdminUnlockRequest) -> Dict[str, Any]:
+    """
+    Exchange a PIN for a short-lived admin token.
+    - Requires base API access (X-API-KEY)
+    - Does NOT require admin key
+    - PIN is verified against ISAC_ADMIN_PIN env var
+    """
+    if not ISAC_ADMIN_PIN:
+        raise HTTPException(
+            status_code=503,
+            detail="Admin unlock is not configured (ISAC_ADMIN_PIN missing).",
+        )
+
+    provided = (body.pin or "").replace("\r", "").strip()
+    expected = ISAC_ADMIN_PIN.replace("\r", "").strip()
+
+    # constant-time compare
+    if not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Invalid PIN")
+
+    issued = _issue_admin_token()
+    return {"status": "ok", **issued}
 
 # ---------------------------------------------------------
 # Phase 7 — Finance (Firefly) READ-ONLY snapshot router
@@ -1590,9 +2058,26 @@ async def _acall_first_existing(
 health_router = APIRouter(prefix="/health", tags=["health"])
 
 
+@health_router.get("")
+async def health_root() -> Dict[str, Any]:
+    """
+    Root health endpoint.
+    NOTE: This maps to `/health` (no trailing slash).
+    Keep it cheap: no external calls, no DB requirements.
+    """
+    return {
+        "status": "ok",
+        "service": "isac-brain",
+        "version": app.version,
+        "message": "ISAC brain is alive",
+    }
+
+
 @health_router.get("/ping")
 async def ping() -> Dict[str, Any]:
+    # Backward/explicit ping endpoint (`/health/ping`)
     return {"status": "ok", "message": "ISAC brain is alive"}
+
 
 
 @health_router.get("/isac_internal")
@@ -1699,6 +2184,869 @@ async def homeassistant_health() -> Dict[str, Any]:
         },
     }
 
+
+# ---------------------------------------------------------
+# Runner router & endpoints (Execution Spine choke point)
+# ---------------------------------------------------------
+
+runner_router = APIRouter(
+    prefix="/runner",
+    tags=["runner"],
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+
+
+def _runner_url(path: str) -> str:
+    base = (JARVIS_RUNNER_BASE_URL or "").rstrip("/")
+    if not base:
+        # Should never happen because we default it, but keep it safe.
+        raise HTTPException(status_code=500, detail="Runner base URL not configured.")
+    if not path.startswith("/"):
+        path = "/" + path
+    return base + path
+
+
+async def _runner_get(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    url = _runner_url(path)
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, params=params)
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        # Preserve upstream status code and body (best-effort)
+        detail: Any
+        try:
+            detail = exc.response.json()
+        except Exception:  # noqa: BLE001
+            detail = {"error": exc.response.text}
+        raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Runner unreachable: {exc}") from exc
+
+    try:
+        return resp.json()
+    except Exception:  # noqa: BLE001
+        return {"ok": True, "raw": resp.text}
+
+
+@runner_router.get("/health")
+async def runner_health() -> Dict[str, Any]:
+    # Proxy to runner's own health endpoint
+    return await _runner_get("/runner/health")
+
+
+@runner_router.get("/fs/list")
+async def runner_fs_list(path: str = Query(..., min_length=1, max_length=512)) -> Dict[str, Any]:
+    # Proxy to runner's safe fs list endpoint
+    return await _runner_get("/runner/fs/list", params={"path": path})
+
+@runner_router.get("/fs/list_and_log")
+async def runner_fs_list_and_log(
+    path: str = Query("/opt/jarvis", min_length=1, max_length=512)
+) -> Dict[str, Any]:
+    # 1) Create task + step
+    task_id = create_task(
+        title="Runner FS list",
+        resume_hint=f"List directory via runner: {path}",
+    )
+
+    lineage_init(task_id=task_id, parent_task_id=None, trigger_reason="manual: runner_fs_list_and_log")
+
+    step_id = add_step(
+        task_id=task_id,
+        step_index=1,
+        description=f"List directory: {path}",
+    )
+
+    # 2) Call runner
+    result = await _runner_get(
+        "/runner/fs/list",
+        params={"path": path},
+    )
+
+    # 3) Store artifact
+    add_artifact(
+        task_id=task_id,
+        step_id=step_id,
+        artifact_type="runner_fs_list",
+        metadata_json=json.dumps(
+            {
+                "path": path,
+                "result": result,
+            }
+        ),
+    )
+
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "step_id": step_id,
+        "runner": result,
+    }
+
+# ---------------------------------------------------------
+# Task Ledger — READ API (Option A)
+# Read-only visibility for Resume vs Abort / crash recovery
+# ---------------------------------------------------------
+
+def _task_db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def _task_row_to_dict(row: tuple) -> Dict[str, Any]:
+    # Expected minimum schema:
+    # tasks(id, title, status, resume_hint, ...)
+    return {
+        "id": row[0],
+        "title": row[1],
+        "status": row[2],
+        "resume_hint": row[3],
+    }
+
+
+def _task_step_row_to_dict(row: tuple) -> Dict[str, Any]:
+    # Minimum schema:
+    # task_steps(id, task_id, step_index, description, status, ...)
+    return {
+        "id": row[0],
+        "task_id": row[1],
+        "step_index": row[2],
+        "description": row[3],
+        "status": row[4],
+    }
+
+
+def _task_artifact_row_to_dict(row: tuple) -> Dict[str, Any]:
+    # Minimum schema:
+    # task_artifacts(id, task_id, step_id, artifact_type, metadata_json, ...)
+    step_id = row[2]
+    metadata_json = row[4]
+    metadata: Optional[Dict[str, Any]] = None
+    if metadata_json:
+        try:
+            metadata = json.loads(metadata_json)
+        except Exception:
+            metadata = None
+
+    return {
+        "id": row[0],
+        "task_id": row[1],
+        # IMPORTANT: allow null step_id (older artifacts or task-level artifacts)
+        "step_id": int(step_id) if step_id is not None else None,
+        "artifact_type": row[3],
+        "metadata_json": metadata_json,
+        "metadata": metadata,
+    }
+def list_tasks(
+    limit: int = 25,
+    status: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 100")
+
+    conn = _task_db_connect()
+    try:
+        cur = conn.cursor()
+
+        if status:
+            # Explicit filter: return tasks matching exactly this status.
+            cur.execute(
+                """
+                SELECT id, title, status, resume_hint
+                FROM tasks
+                WHERE status = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (status, limit),
+            )
+        else:
+            # Default: unfinished only (v1 rule: "done" == completed).
+            cur.execute(
+                """
+                SELECT id, title, status, resume_hint
+                FROM tasks
+                WHERE status != 'completed'
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+
+        rows = cur.fetchall() or []
+        return [_task_row_to_dict(r) for r in rows]
+    finally:
+        conn.close()
+
+@app.get(
+    "/tasks",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+def list_tasks_endpoint(
+    limit: int = Query(25, ge=1, le=100),
+    status: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    tasks = list_tasks(limit=limit, status=status)
+
+    return {
+        "count": len(tasks),
+        "limit": limit,
+        "status": status,
+        "tasks": tasks,
+    }
+
+@app.get(
+    "/tasks/{task_id}",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+def get_task(task_id: int) -> Dict[str, Any]:
+    if task_id < 1:
+        raise HTTPException(status_code=400, detail="task_id must be >= 1")
+
+    conn = _task_db_connect()
+    try:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT id, title, status, resume_hint
+            FROM tasks
+            WHERE id = ?
+            """,
+            (task_id,),
+        )
+        task_row = cur.fetchone()
+        if not task_row:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        cur.execute(
+            """
+            SELECT id, task_id, step_index, description, status
+            FROM task_steps
+            WHERE task_id = ?
+            ORDER BY step_index ASC, id ASC
+            """,
+            (task_id,),
+        )
+        step_rows = cur.fetchall() or []
+
+        cur.execute(
+            """
+            SELECT id, task_id, step_id, artifact_type, metadata_json
+            FROM task_artifacts
+            WHERE task_id = ?
+            ORDER BY id ASC
+            """,
+            (task_id,),
+        )
+        artifact_rows = cur.fetchall() or []
+
+        return {
+            "task": _task_row_to_dict(task_row),
+            "steps": [_task_step_row_to_dict(r) for r in step_rows],
+            "artifacts": [_task_artifact_row_to_dict(r) for r in artifact_rows],
+        }
+    finally:
+        conn.close()
+
+# ---------------------------------------------------------
+# Task Ledger — CREATE (public, safe)  (Option A)
+# Creates a pending task that can later be Resumed (ISAC-only execution)
+# NOTE: This does NOT call the runner. It only writes to the ledger.
+# ---------------------------------------------------------
+
+@app.post(
+    "/tasks/create/runner_fs_list",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+def create_runner_fs_list_task(
+    path: str = Query("/opt/jarvis", min_length=1, max_length=512),
+    parent_task_id: Optional[int] = Query(None),
+    trigger_reason: Optional[str] = Query(None, max_length=256),
+) -> Dict[str, Any]:
+    task_id = create_task(
+        title="Runner FS list",
+        resume_hint=f"List directory via runner: {path}",
+    )
+
+    # Optional: seed an initial step for visibility/audit trail
+    add_step(
+        task_id=task_id,
+        step_index=1,
+        description=f"Task created (pending). Resume will list directory: {path}",
+    )
+
+
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "title": "Runner FS list",
+        "status": "pending",
+        "resume_hint": f"List directory via runner: {path}",
+    }
+
+# ---------------------------------------------------------
+# Task Ledger — ACTIONS (Abort / Resume)
+# Execution Spine v1.3
+# ---------------------------------------------------------
+
+def _task_update_status(task_id: int, status: str) -> None:
+    conn = _task_db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE tasks
+            SET status = ?
+            WHERE id = ?
+            """,
+            (status, task_id),
+        )
+        conn.commit()
+        if cur.rowcount < 1:
+            raise HTTPException(status_code=404, detail="Task not found")
+    finally:
+        conn.close()
+
+
+def _task_get_min(task_id: int) -> Dict[str, Any]:
+    conn = _task_db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, title, status, resume_hint
+            FROM tasks
+            WHERE id = ?
+            """,
+            (task_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return _task_row_to_dict(row)
+    finally:
+        conn.close()
+
+def _task_get_latest_artifact(task_id: int, artifact_type: str) -> Optional[Dict[str, Any]]:
+    """Fetch the most recent artifact of a given type for a task."""
+    conn = _task_db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, task_id, step_id, artifact_type, metadata_json
+            FROM task_artifacts
+            WHERE task_id = ? AND artifact_type = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (task_id, artifact_type),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return _task_artifact_row_to_dict(row)
+    finally:
+        conn.close()
+
+
+
+
+def _is_path_allowed(path: str) -> bool:
+    """Write allowlist (locked): /opt/jarvis/brain/** and /opt/jarvis/data/index.html"""
+    if not path:
+        return False
+    norm = os.path.abspath(path)
+    if norm.startswith("/opt/jarvis/brain/"):
+        return True
+    if norm == "/opt/jarvis/data/index.html":
+        return True
+    return False
+
+
+def _atomic_write_text(path: str, content: str) -> None:
+    """Atomic apply: temp -> fsync -> rename."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(prefix=".isac_tmp_", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+async def _http_verify_template() -> Dict[str, Any]:
+    """
+    Auto-verify template (v3):
+    - Backend health via http://127.0.0.1:8000/health
+    - UI reachability via ISAC_UI_VERIFY_URL (default http://jarvis-agent/)
+    HTTP only. No Node.
+    """
+    backend_url = os.getenv("ISAC_BACKEND_VERIFY_URL", "http://127.0.0.1:8000/health")
+    ui_url = os.getenv("ISAC_UI_VERIFY_URL", "http://jarvis-agent/")
+
+    results: Dict[str, Any] = {"backend": {}, "ui": {}}
+    ok = True
+
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        # Backend
+        try:
+            r = await client.get(backend_url, headers={"Accept": "application/json"})
+            results["backend"] = {"url": backend_url, "status_code": r.status_code}
+            if r.status_code != 200:
+                ok = False
+        except Exception as e:
+            results["backend"] = {"url": backend_url, "error": str(e)}
+            ok = False
+
+        # UI
+        try:
+            r = await client.get(ui_url, headers={"Accept": "text/html"})
+            results["ui"] = {"url": ui_url, "status_code": r.status_code}
+            if r.status_code != 200:
+                ok = False
+        except Exception as e:
+            results["ui"] = {"url": ui_url, "error": str(e)}
+            ok = False
+
+    results["ok"] = ok
+    return results
+
+def _task_next_step_index(task_id: int) -> int:
+    conn = _task_db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(step_index), 0)
+            FROM task_steps
+            WHERE task_id = ?
+            """,
+            (task_id,),
+        )
+        max_idx = cur.fetchone()[0] or 0
+        return int(max_idx) + 1
+    finally:
+        conn.close()
+
+
+def _parse_runner_fs_list_resume_hint(resume_hint: Optional[str]) -> Optional[str]:
+    """
+    Supported v1 resume intent:
+      "List directory via runner: /opt/jarvis"
+    Returns extracted path or None.
+    """
+    if not resume_hint:
+        return None
+    prefix = "List directory via runner:"
+    if not resume_hint.startswith(prefix):
+        return None
+    path = resume_hint[len(prefix):].strip()
+    return path or None
+
+@app.post(
+    "/tasks/create/tooling_probe",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+def create_tooling_probe_task(
+    parent_task_id: Optional[int] = Query(None),
+    trigger_reason: Optional[str] = Query("manual", max_length=256),
+) -> Dict[str, Any]:
+    """
+    v2 Evidence: Create a pending task that, when resumed, captures an environment/tooling
+    assumptions artifact into the ledger.
+    """
+    task_id = create_task(
+        title="Tooling probe",
+        resume_hint="Capture environment/tooling assumptions snapshot (v2 evidence).",
+    )
+    lineage_init(task_id=task_id, parent_task_id=parent_task_id, trigger_reason=trigger_reason)
+    add_step(
+        task_id=task_id,
+        step_index=1,
+        description="Task created (pending). Resume will capture tooling_probe snapshot.",
+    )
+    return {"ok": True, "task_id": task_id}
+
+
+
+# ---------------------------------------------------------
+# Escape Hatch v3 — Templates: File Write (dry-run by default)
+# ---------------------------------------------------------
+
+class FileWriteTaskCreateRequest(BaseModel):
+    path: str = Field(..., min_length=1, max_length=512)
+    content_b64: str = Field(..., min_length=1)  # UTF-8 content, base64-encoded
+    dry_run: bool = True
+    parent_task_id: Optional[int] = None
+    trigger_reason: Optional[str] = Field(None, max_length=256)
+
+
+@app.post(
+    "/tasks/create/file_write",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+def create_file_write_task(body: FileWriteTaskCreateRequest) -> Dict[str, Any]:
+    # Hard caps (v3 conservative defaults)
+    MAX_CONTENT_BYTES = int(os.getenv("ISAC_FILE_WRITE_MAX_BYTES", "200000"))  # 200 KB default
+
+    try:
+        raw = base64.b64decode(body.content_b64.encode("utf-8"), validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="content_b64 must be valid base64")
+
+    if len(raw) > MAX_CONTENT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"content exceeds cap ({len(raw)} bytes > {MAX_CONTENT_BYTES} bytes)",
+        )
+
+    # Validate UTF-8 for predictable behavior
+    try:
+        content_text = raw.decode("utf-8")
+    except Exception:
+        raise HTTPException(status_code=400, detail="content must be UTF-8 text")
+
+    sha256 = hashlib.sha256(raw).hexdigest()
+
+    task_id = create_task(
+        title="File write",
+        resume_hint=f"Write file (v3 template): {body.path}",
+    )
+
+    # Linkage (v2+)
+    if body.parent_task_id is not None or body.trigger_reason is not None:
+        lineage_link_task(
+            task_id=task_id,
+            parent_task_id=body.parent_task_id,
+            trigger_reason=body.trigger_reason,
+        )
+
+    add_artifact(
+        task_id=task_id,
+        artifact_type="file_write_proposal",
+        metadata_json=json.dumps(
+            {
+                "path": body.path,
+                "dry_run": bool(body.dry_run),
+                "bytes": len(raw),
+                "sha256": sha256,
+                "content_b64": body.content_b64,
+            }
+        ),
+    )
+
+    add_step(
+        task_id=task_id,
+        step_index=1,
+        description=f"Created pending file write task for {body.path} (dry_run={bool(body.dry_run)})",
+    )
+
+    return {"status": "ok", "task_id": task_id, "sha256": sha256, "bytes": len(raw), "dry_run": bool(body.dry_run)}
+
+
+@app.post(
+    "/tasks/{task_id}/abort",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+def abort_task(task_id: int) -> Dict[str, Any]:
+    """
+    Ledger-only abort:
+    - No runner execution
+    - Just marks task status = 'aborted'
+    """
+    if task_id < 1:
+        raise HTTPException(status_code=400, detail="task_id must be >= 1")
+
+    task = _task_get_min(task_id)
+
+    # If already completed, don't mutate silently.
+    if task.get("status") == "completed":
+        raise HTTPException(status_code=409, detail="Task is already completed")
+
+    _task_update_status(task_id, "aborted")
+    return {"status": "ok", "task_id": task_id, "new_status": "aborted"}
+
+
+@app.post(
+    "/tasks/{task_id}/resume/preview",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+def resume_task_preview(task_id: int) -> Dict[str, Any]:
+    """
+    Preview what resume would do (no execution).
+    """
+    if task_id < 1:
+        raise HTTPException(status_code=400, detail="task_id must be >= 1")
+
+    task = _task_get_min(task_id)
+    title = str(task.get("title") or "")
+    resume_hint = task.get("resume_hint")
+
+    if title == "Runner FS list":
+        path = _parse_runner_fs_list_resume_hint(resume_hint)
+        if not path:
+            return {
+                "status": "ok",
+                "task_id": task_id,
+                "supported": False,
+                "message": "Runner FS list task is missing its path (resume_hint parse failed).",
+                "task": task,
+            }
+        return {
+            "status": "ok",
+            "task_id": task_id,
+            "supported": True,
+            "message": "Will re-run runner fs list for the same path, log a new step+artifact, then mark the task completed.",
+            "task": task,
+            "plan": {"action": "runner_fs_list", "path": path},
+        }
+
+    if title == "Tooling probe":
+        return {
+            "status": "ok",
+            "task_id": task_id,
+            "supported": True,
+            "message": "Will capture a tooling_probe snapshot (read-only) and store it as an artifact, then mark the task completed.",
+            "task": task,
+            "plan": {"action": "tooling_probe"},
+        }
+
+    return {
+        "status": "ok",
+        "task_id": task_id,
+        "supported": False,
+        "message": "Resume not supported for this task type yet.",
+        "task": task,
+    }
+
+@app.post(
+    "/tasks/{task_id}/resume/plan",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+def resume_task_plan(task_id: int):
+    # Alias for UI compatibility
+    return resume_task_preview(task_id)
+
+@app.post(
+    "/tasks/{task_id}/resume",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+async def resume_task(task_id: int) -> Dict[str, Any]:
+    """
+    Resume (Execution Spine):
+    - Enforces single-execution concurrency guard (v2)
+    - Supports:
+        * Runner FS list (v1.3)
+        * Tooling probe (v2 evidence)
+    """
+    if task_id < 1:
+        raise HTTPException(status_code=400, detail="task_id must be >= 1")
+
+    task = _task_get_min(task_id)
+    title = str(task.get("title") or "")
+    status = str(task.get("status") or "")
+    resume_hint = task.get("resume_hint")
+
+    if status == "completed":
+        raise HTTPException(status_code=409, detail="Task is already completed")
+    if status == "aborted":
+        raise HTTPException(status_code=409, detail="Task is aborted; create a new task instead.")
+
+    # Human exit rule scaffold (per-lineage): stop after 2 verify failures.
+    # v2 doesn't run verify templates yet, but we enforce the guardrail now.
+    if lineage_get_verify_failures(task_id) >= 2:
+        raise HTTPException(
+            status_code=409,
+            detail="Lineage has reached the verify-failure cap (>=2). Human intervention required before continuing.",
+        )
+
+    lock = ExecutionLock()
+    try:
+        lock.acquire()
+    except ExecutionLockError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    timing_mark_started(task_id)
+
+    try:
+        # ---- File write (v3 template) ----
+        if title == "File write":
+            proposal = _task_get_latest_artifact(task_id, "file_write_proposal")
+            if not proposal:
+                raise HTTPException(status_code=400, detail="Missing file_write_proposal artifact")
+
+            meta = proposal.get("metadata") or {}
+            path = str(meta.get("path") or "")
+            dry_run = bool(meta.get("dry_run", True))
+            content_b64 = str(meta.get("content_b64") or "")
+            sha256 = str(meta.get("sha256") or "")
+            declared_bytes = int(meta.get("bytes") or 0)
+
+            if not _is_path_allowed(path):
+                raise HTTPException(status_code=403, detail="Target path is not in write allowlist")
+
+            try:
+                raw = base64.b64decode(content_b64.encode("utf-8"), validate=True)
+            except Exception:
+                raise HTTPException(status_code=400, detail="Stored content_b64 is invalid base64")
+
+            if declared_bytes and declared_bytes != len(raw):
+                # Not fatal, but we log it
+                add_step(
+                    task_id=task_id,
+                    step_index=_task_next_step_index(task_id),
+                    description=f"Warning: stored byte count mismatch (declared={declared_bytes}, actual={len(raw)})",
+                )
+
+            if hashlib.sha256(raw).hexdigest() != sha256:
+                raise HTTPException(status_code=409, detail="Content hash mismatch; refusing to proceed")
+
+            content_text = raw.decode("utf-8")
+
+            next_idx = _task_next_step_index(task_id)
+            step_id = add_step(
+                task_id=task_id,
+                step_index=next_idx,
+                description=f"Resume: file write template → {path} (dry_run={dry_run})",
+            )
+
+            if dry_run:
+                add_artifact(
+                    task_id=task_id,
+                    step_id=step_id,
+                    artifact_type="file_write_dry_run",
+                    metadata_json=json.dumps({"path": path, "sha256": sha256, "bytes": len(raw), "would_write": True}),
+                )
+            else:
+                try:
+                    _atomic_write_text(path, content_text)
+                except Exception as e:
+                    failures_record(task_id, step_id=step_id, failure_class=FailureClass.WRITE.value, message=str(e))
+                    raise
+                add_artifact(
+                    task_id=task_id,
+                    step_id=step_id,
+                    artifact_type="file_write_applied",
+                    metadata_json=json.dumps({"path": path, "sha256": sha256, "bytes": len(raw)}),
+                )
+
+            # Auto-verify always on (v3)
+            verify = await _http_verify_template()
+            add_artifact(
+                task_id=task_id,
+                step_id=step_id,
+                artifact_type="verify_http",
+                metadata_json=json.dumps(verify),
+            )
+
+            if not verify.get("ok"):
+                # Record and increment per-lineage verify failures
+                failures_record(task_id, step_id=step_id, failure_class=FailureClass.VERIFY.value, message="HTTP verify template failed")
+                lineage_inc_verify_failures(task_id)
+                raise HTTPException(status_code=409, detail="Verify failed; refusing to mark task completed")
+
+            _task_update_status(task_id, "completed")
+            return {"status": "ok", "task_id": task_id, "dry_run": dry_run, "verify": verify}
+
+        # ---- Runner FS list (existing) ----
+        if title == "Runner FS list":
+            path = _parse_runner_fs_list_resume_hint(resume_hint)
+            if not path:
+                raise HTTPException(status_code=400, detail="Unable to parse path from resume_hint")
+
+            next_idx = _task_next_step_index(task_id)
+            step_id = add_step(
+                task_id=task_id,
+                step_index=next_idx,
+                description=f"Resume: list directory: {path}",
+            )
+
+            result = await _runner_get("/runner/fs/list", params={"path": path})
+
+            add_artifact(
+                task_id=task_id,
+                step_id=step_id,
+                artifact_type="runner_fs_list",
+                metadata_json=json.dumps({"path": path, "result": result}),
+            )
+
+            _task_update_status(task_id, "completed")
+            timing_mark_finished(task_id)
+
+            return {
+                "status": "ok",
+                "task_id": task_id,
+                "action": "runner_fs_list",
+                "completed": True,
+            }
+
+        # ---- Tooling probe (v2 evidence) ----
+        if title == "Tooling probe":
+            next_idx = _task_next_step_index(task_id)
+            step_id = add_step(
+                task_id=task_id,
+                step_index=next_idx,
+                description="Execute: capture tooling_probe snapshot (read-only).",
+            )
+
+            snapshot = tooling_probe_snapshot()
+
+            add_artifact(
+                task_id=task_id,
+                step_id=step_id,
+                artifact_type="tooling_probe",
+                metadata_json=json.dumps(snapshot),
+            )
+
+            _task_update_status(task_id, "completed")
+            timing_mark_finished(task_id)
+
+            return {
+                "status": "ok",
+                "task_id": task_id,
+                "action": "tooling_probe",
+                "completed": True,
+            }
+
+        # Unknown task type
+        raise HTTPException(status_code=400, detail="Resume not supported for this task type yet.")
+
+    except HTTPException:
+        # Preserve FastAPI HTTP errors, but record failure classification.
+        # step_id is unknown here; store NULL.
+        # Note: do not increment verify_failures in v2 (no verify templates yet).
+        failures_record(task_id=task_id, step_id=None, failure_class=FailureClass.GUARDRAIL, message="HTTPException raised during resume")
+        raise
+    except Exception as exc:
+        fc = _failure_class_from_exception(exc)
+        failures_record(task_id=task_id, step_id=None, failure_class=str(fc), message=str(exc))
+        raise HTTPException(status_code=500, detail=f"Resume failed: {exc}")
+    finally:
+        try:
+            lock.release()
+        finally:
+            pass
+
+@app.post(
+    "/tasks/{task_id}/resume/confirm",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+async def resume_task_confirm(task_id: int):
+    # UI compatibility shim: confirm → execute
+    return await resume_task(task_id)
 
 # ---------------------------------------------------------
 # Home Assistant router & endpoints
@@ -3335,7 +4683,7 @@ async def sqlite_integrity_error_handler(
 # ----------------------------
 
 app.include_router(health_router)
-
+app.include_router(runner_router)
 # Alice (Phase 8) — read-only preview endpoint
 app.include_router(alice_router)
 app.include_router(alice_memory_router)
