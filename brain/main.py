@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 import base64
 import hashlib
@@ -228,6 +229,8 @@ def _failure_class_from_exception(exc: Exception) -> str:
 # ----------------------------
 
 DB_PATH = os.getenv("JARVIS_DB_PATH", "/app/data/jarvis_brain.db")
+ENABLE_DIFF_APPLY = os.getenv("ENABLE_DIFF_APPLY", "0").strip() in ("1","true","TRUE","yes","YES")
+
 
 JARVIS_LLM_PROVIDER = os.getenv("JARVIS_LLM_PROVIDER", "openai-compatible")
 JARVIS_LLM_MODEL = os.getenv("JARVIS_LLM_MODEL", "gpt-4.1-mini")
@@ -1049,6 +1052,7 @@ def require_api_key(
     x_api_key: Optional[str] = Header(default=None),
     x_isac_readonly_key: Optional[str] = Header(default=None),
     x_isac_admin_key: Optional[str] = Header(default=None),
+    x_isac_admin_token: Optional[str] = Header(default=None),
 ) -> None:
     """
     Unified read auth gate (LOCKED INTENT):
@@ -1056,42 +1060,45 @@ def require_api_key(
     - Adds Alice/ISAC support:
         X-ISAC-READONLY-KEY == ISAC_READONLY_API_KEY
         X-ISAC-ADMIN-KEY   == ISAC_ADMIN_API_KEY or ISAC_ADMIN_KEY
+    - NEW (v4 contract fix):
+        X-ISAC-ADMIN-TOKEN is accepted if valid, so PIN-unlock can satisfy read gates.
 
-    If none of these keys are configured, access is open (no-op).
+    If none of these are configured, access is open (no-op).
     """
 
     def _clean(v: Optional[str]) -> str:
-        # Protect against CRLF env values and copy/paste whitespace.
         return (v or "").replace("\r", "").strip()
 
-    jarvis_key = _clean(API_KEY)
-
+    jarvis_key = _clean(os.getenv("JARVIS_API_KEY"))
     readonly_cfg = _clean(os.getenv("ISAC_READONLY_API_KEY"))
     admin_cfg = _clean(os.getenv("ISAC_ADMIN_API_KEY") or os.getenv("ISAC_ADMIN_KEY"))
-
-    # Clean incoming headers too (defensive)
-    x_api_key = _clean(x_api_key)
-    x_isac_readonly_key = _clean(x_isac_readonly_key)
-    x_isac_admin_key = _clean(x_isac_admin_key)
+    configured_pin = _clean(ISAC_ADMIN_PIN)
 
     # If nothing is configured, do not gate.
-    if not jarvis_key and not readonly_cfg and not admin_cfg:
+    if not jarvis_key and not readonly_cfg and not admin_cfg and not configured_pin:
+        return
+
+    # 0) If an admin token is presented and valid, accept it as read auth.
+    # This lets PIN-unlock power read-gated admin views (e.g. /tasks) without requiring API keys.
+    token = _clean(x_isac_admin_token)
+    if token and _is_valid_admin_token(token):
         return
 
     # Accept any configured key presented via its corresponding header.
-    if jarvis_key and x_api_key == jarvis_key:
+    if jarvis_key and _clean(x_api_key) == jarvis_key:
         return
 
-    if readonly_cfg and x_isac_readonly_key == readonly_cfg:
+    if readonly_cfg and _clean(x_isac_readonly_key) == readonly_cfg:
         return
 
-    if admin_cfg and x_isac_admin_key == admin_cfg:
+    if admin_cfg and _clean(x_isac_admin_key) == admin_cfg:
         return
 
     raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 def require_admin_if_configured(
+    request: Request,
     x_isac_admin_key: Optional[str] = Header(default=None),
     x_isac_admin_token: Optional[str] = Header(default=None),
 ) -> None:
@@ -1104,6 +1111,9 @@ def require_admin_if_configured(
       (requires ISAC_ADMIN_PIN to be configured)
 
     If neither an admin key nor a PIN is configured, this gate is open (no-op).
+
+    Additionally, stamps request.state.admin_* fields so endpoints can expose
+    non-authoritative UI hints (e.g., "admin via token").
     """
 
     def _clean(v: Optional[str]) -> str:
@@ -1112,16 +1122,24 @@ def require_admin_if_configured(
     configured_key = _clean(os.getenv("ISAC_ADMIN_API_KEY") or os.getenv("ISAC_ADMIN_KEY"))
     configured_pin = _clean(ISAC_ADMIN_PIN)
 
+    # Default: not unlocked (only used for optional response hints)
+    request.state.admin_unlocked = False
+    request.state.admin_via = None
+
     # If nothing is configured, do not gate.
     if not configured_key and not configured_pin:
         return
 
     # 1) Legacy/admin key path (always allowed if configured)
     if configured_key and _clean(x_isac_admin_key) == configured_key:
+        request.state.admin_unlocked = True
+        request.state.admin_via = "key"
         return
 
     # 2) Token path (only valid if PIN configured)
     if configured_pin and _is_valid_admin_token(_clean(x_isac_admin_token)):
+        request.state.admin_unlocked = True
+        request.state.admin_via = "token"
         return
 
     raise HTTPException(status_code=401, detail="Invalid or missing admin credentials")
@@ -1177,25 +1195,22 @@ class AdminUnlockRequest(BaseModel):
     pin: str = Field(..., min_length=1, description="Admin PIN/passphrase (server-side)")
 
 
-@app.post(
-    "/auth/admin/unlock",
-    dependencies=[Depends(require_api_key)],
-)
+@app.post("/auth/admin/unlock")
 def auth_admin_unlock(body: AdminUnlockRequest) -> Dict[str, Any]:
     """
     Exchange a PIN for a short-lived admin token.
-    - Requires base API access (X-API-KEY)
-    - Does NOT require admin key
-    - PIN is verified against ISAC_ADMIN_PIN env var
-    """
-    if not ISAC_ADMIN_PIN:
-        raise HTTPException(
-            status_code=503,
-            detail="Admin unlock is not configured (ISAC_ADMIN_PIN missing).",
-        )
 
-    provided = (body.pin or "").replace("\r", "").strip()
-    expected = ISAC_ADMIN_PIN.replace("\r", "").strip()
+    Contract (LOCKED):
+    - This endpoint is PIN-only (no API key required).
+    - PIN is verified against ISAC_ADMIN_PIN env var.
+    - Admin-gated endpoints still require the admin API key and/or a valid admin token.
+    """
+    expected = (ISAC_ADMIN_PIN or "").strip()
+    provided = (body.pin or "").strip()
+
+    if not expected:
+        # Misconfiguration: no PIN set server-side.
+        raise HTTPException(status_code=500, detail="Admin PIN not configured")
 
     # constant-time compare
     if not hmac.compare_digest(provided, expected):
@@ -2385,15 +2400,20 @@ def list_tasks(
     dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
 )
 def list_tasks_endpoint(
+    request: Request,
     limit: int = Query(25, ge=1, le=100),
     status: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
     tasks = list_tasks(limit=limit, status=status)
 
+    admin_via = getattr(request.state, "admin_via", None)
+
     return {
         "count": len(tasks),
         "limit": limit,
         "status": status,
+        "admin": True,
+        "admin_via": admin_via,  # "token" | "key" | None
         "tasks": tasks,
     }
 
@@ -2401,7 +2421,7 @@ def list_tasks_endpoint(
     "/tasks/{task_id}",
     dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
 )
-def get_task(task_id: int) -> Dict[str, Any]:
+def get_task(request: Request, task_id: int) -> Dict[str, Any]:
     if task_id < 1:
         raise HTTPException(status_code=400, detail="task_id must be >= 1")
 
@@ -2443,7 +2463,11 @@ def get_task(task_id: int) -> Dict[str, Any]:
         )
         artifact_rows = cur.fetchall() or []
 
+        admin_via = getattr(request.state, "admin_via", None)
+
         return {
+            "admin": True,
+            "admin_via": admin_via,  # "token" | "key" | None
             "task": _task_row_to_dict(task_row),
             "steps": [_task_step_row_to_dict(r) for r in step_rows],
             "artifacts": [_task_artifact_row_to_dict(r) for r in artifact_rows],
@@ -2567,6 +2591,50 @@ def _is_path_allowed(path: str) -> bool:
     return False
 
 
+
+def resolve_target_path(user_path: str, must_exist: bool = True) -> Optional[str]:
+    """Resolve a user-facing path (host-style) to an on-container filesystem path.
+
+    v4 note: The user is allowed to refer to host paths like /opt/jarvis/brain/**, but
+    inside the container the code lives under /app/**. We attempt a conservative mapping.
+
+    This resolver never expands scope: it only maps known prefixes and only returns an
+    existing file (when must_exist=True).
+    """
+    p = (user_path or "").strip()
+    if not p:
+        return None
+
+    candidates = [p]
+
+    # Known mount: /opt/jarvis/brain -> /app
+    if p == "/opt/jarvis/brain/main.py":
+        candidates.append("/app/main.py")
+    if p.startswith("/opt/jarvis/brain/"):
+        rel = p[len("/opt/jarvis/brain/"):]
+        candidates.append("/app/" + rel)
+    if p == "/opt/jarvis/brain":
+        candidates.append("/app")
+
+    # As a last resort, if user passed a relative-ish path, try under /app
+    if not p.startswith("/") and p:
+        candidates.append("/app/" + p)
+
+    for c in candidates:
+        try:
+            if must_exist:
+                if Path(c).exists():
+                    return c
+            else:
+                # For writes, allow resolving to a path under a known directory if the parent exists.
+                parent = Path(c).parent
+                if parent.exists():
+                    return c
+        except Exception:
+            continue
+    return None
+
+
 def _atomic_write_text(path: str, content: str) -> None:
     """Atomic apply: temp -> fsync -> rename."""
     directory = os.path.dirname(os.path.abspath(path))
@@ -2623,6 +2691,133 @@ async def _http_verify_template() -> Dict[str, Any]:
 
     results["ok"] = ok
     return results
+
+def _parse_diff_apply_resume_hint(resume_hint: Any) -> Optional[Dict[str, Any]]:
+    """Parse resume_hint for Diff Apply tasks."""
+    try:
+        if resume_hint is None:
+            return None
+        if isinstance(resume_hint, str):
+            resume_hint = resume_hint.strip()
+            if not resume_hint:
+                return None
+            payload = json.loads(resume_hint)
+        elif isinstance(resume_hint, dict):
+            payload = resume_hint
+        else:
+            return None
+
+        path = str(payload.get("path") or "").strip()
+        unified_diff_b64 = str(payload.get("unified_diff_b64") or "").strip()
+        dry_run = bool(payload.get("dry_run", True))
+
+        if not path or not unified_diff_b64:
+            return None
+
+        return {"path": path, "unified_diff_b64": unified_diff_b64, "dry_run": dry_run}
+    except Exception:
+        return None
+
+
+def _apply_unified_diff(original_text: str, diff_text: str) -> Dict[str, Any]:
+    """
+    Apply a unified diff to original_text.
+
+    Constraints (v4):
+    - Supports single-file diffs.
+    - Requires all hunks to apply cleanly (no fuzzy matching).
+    - Returns patched text plus stats (additions, deletions, hunks).
+    """
+    original_lines = original_text.splitlines(keepends=True)
+    diff_lines = diff_text.splitlines(keepends=True)
+
+    # Strip any leading noise before the first file header if present
+    i = 0
+    while i < len(diff_lines) and not diff_lines[i].startswith("--- "):
+        i += 1
+    diff_lines = diff_lines[i:]
+
+    if len(diff_lines) < 2 or not diff_lines[0].startswith("--- ") or not diff_lines[1].startswith("+++ "):
+        raise ValueError("diff must start with '---' and '+++' file headers")
+
+    # Skip file headers
+    j = 2
+
+    out: List[str] = []
+    src_idx = 0
+    hunks = 0
+    additions = 0
+    deletions = 0
+
+    hunk_re = re.compile(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@")
+
+    while j < len(diff_lines):
+        line = diff_lines[j]
+        if not line.startswith("@@"):
+            # Allow trailing metadata lines, but ignore
+            j += 1
+            continue
+
+        m = hunk_re.match(line.rstrip("\n"))
+        if not m:
+            raise ValueError(f"invalid hunk header: {line.strip()}")
+
+        hunks += 1
+        old_start = int(m.group(1))
+        old_count = int(m.group(2) or "1")
+
+        # Copy unchanged content up to hunk start (1-based in diff)
+        target_idx = max(old_start - 1, 0)
+        if target_idx < src_idx:
+            raise ValueError("hunk overlaps or is out of order")
+        out.extend(original_lines[src_idx:target_idx])
+        src_idx = target_idx
+
+        j += 1  # move past hunk header
+
+        # Apply hunk body
+        while j < len(diff_lines):
+            dl = diff_lines[j]
+            if dl.startswith("@@"):
+                break
+            if dl.startswith("\\"):
+                # e.g. "\ No newline at end of file" -> ignore
+                j += 1
+                continue
+
+            if dl.startswith(" "):
+                expected = dl[1:]
+                if src_idx >= len(original_lines) or original_lines[src_idx] != expected:
+                    raise ValueError("context mismatch while applying diff")
+                out.append(original_lines[src_idx])
+                src_idx += 1
+            elif dl.startswith("-"):
+                expected = dl[1:]
+                if src_idx >= len(original_lines) or original_lines[src_idx] != expected:
+                    raise ValueError("deletion mismatch while applying diff")
+                # skip line (delete)
+                src_idx += 1
+                deletions += 1
+            elif dl.startswith("+"):
+                out.append(dl[1:])
+                additions += 1
+            else:
+                raise ValueError(f"unexpected diff line: {dl.strip()}")
+
+            j += 1
+
+    # Append remainder
+    out.extend(original_lines[src_idx:])
+
+    patched_text = "".join(out)
+    return {
+        "patched_text": patched_text,
+        "hunks": hunks,
+        "additions": additions,
+        "deletions": deletions,
+    }
+
+
 
 def _task_next_step_index(task_id: int) -> int:
     conn = _task_db_connect()
@@ -2694,6 +2889,13 @@ class FileWriteTaskCreateRequest(BaseModel):
     trigger_reason: Optional[str] = Field(None, max_length=256)
 
 
+class DiffApplyTaskCreateRequest(BaseModel):
+    path: str = Field(..., min_length=1)
+    unified_diff_b64: str = Field(..., min_length=1, description="Base64-encoded unified diff text")
+    dry_run: bool = True
+
+
+
 @app.post(
     "/tasks/create/file_write",
     dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
@@ -2741,6 +2943,7 @@ def create_file_write_task(body: FileWriteTaskCreateRequest) -> Dict[str, Any]:
             {
                 "path": body.path,
                 "dry_run": bool(body.dry_run),
+                "unified_diff_b64": body.unified_diff_b64,
                 "bytes": len(raw),
                 "sha256": sha256,
                 "content_b64": body.content_b64,
@@ -2756,6 +2959,180 @@ def create_file_write_task(body: FileWriteTaskCreateRequest) -> Dict[str, Any]:
 
     return {"status": "ok", "task_id": task_id, "sha256": sha256, "bytes": len(raw), "dry_run": bool(body.dry_run)}
 
+
+
+
+@app.post(
+    "/tasks/create/file_replace",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+def create_file_replace_task(body: FileWriteTaskCreateRequest) -> Dict[str, Any]:
+    # Hard caps (v3 conservative defaults)
+    MAX_CONTENT_BYTES = int(os.getenv("ISAC_FILE_WRITE_MAX_BYTES", "200000"))  # 200 KB default
+
+    try:
+        raw = base64.b64decode(body.content_b64.encode("utf-8"), validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="content_b64 must be valid base64")
+
+    if len(raw) > MAX_CONTENT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"content exceeds cap ({len(raw)} bytes > {MAX_CONTENT_BYTES} bytes)",
+        )
+
+    # Validate UTF-8 for predictable behavior
+    try:
+        content_text = raw.decode("utf-8")
+    except Exception:
+        raise HTTPException(status_code=400, detail="content must be UTF-8 text")
+
+    sha256 = hashlib.sha256(raw).hexdigest()
+
+    task_id = create_task(
+        title="File replace",
+        resume_hint=f"Write file (v3 template): {body.path}",
+    )
+
+    # Linkage (v2+)
+    if body.parent_task_id is not None or body.trigger_reason is not None:
+        lineage_link_task(
+            task_id=task_id,
+            parent_task_id=body.parent_task_id,
+            trigger_reason=body.trigger_reason,
+        )
+
+    add_artifact(
+        task_id=task_id,
+        artifact_type="file_write_proposal",
+        metadata_json=json.dumps(
+            {
+                "path": body.path,
+                "dry_run": bool(body.dry_run),
+                "content_b64": body.content_b64,
+                "bytes": len(raw),
+                "sha256": sha256,
+                "content_b64": body.content_b64,
+            }
+        ),
+    )
+
+    add_step(
+        task_id=task_id,
+        step_index=1,
+        description=f"Created pending file replace task for {body.path} (dry_run={bool(body.dry_run)})",
+    )
+
+    return {"status": "ok", "task_id": task_id, "sha256": sha256, "bytes": len(raw), "dry_run": bool(body.dry_run)}
+
+
+@app.post(
+    "/tasks/create/diff_apply",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+def create_diff_apply_task(body: DiffApplyTaskCreateRequest) -> Dict[str, Any]:
+    if not ENABLE_DIFF_APPLY:
+        raise HTTPException(status_code=403, detail="Diff-apply is disabled in v5 (ENABLE_DIFF_APPLY=1 to enable). Use file replace tasks instead.")
+
+    # Hard caps (v4 conservative defaults)
+    MAX_DIFF_BYTES = int(os.getenv("ISAC_DIFF_APPLY_MAX_BYTES", "200000"))  # 200 KB default
+
+    path = body.path.strip()
+    if not _is_path_allowed(path):
+        raise HTTPException(status_code=403, detail="path not in write allowlist")
+
+    resolved_path = resolve_target_path(path, must_exist=True)
+    if not resolved_path:
+        raise HTTPException(status_code=400, detail=f"unable to read target file: no such file for path '{path}'")
+
+    try:
+        diff_raw = base64.b64decode(body.unified_diff_b64.encode("utf-8"), validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="unified_diff_b64 must be valid base64")
+
+    if len(diff_raw) > MAX_DIFF_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"diff exceeds cap ({len(diff_raw)} bytes > {MAX_DIFF_BYTES} bytes)",
+        )
+
+    try:
+        diff_text = diff_raw.decode("utf-8")
+    except Exception:
+        raise HTTPException(status_code=400, detail="diff must decode as UTF-8")
+
+    # Pre-compute before/after hashes for preview + audit
+    try:
+        before_text = Path(resolved_path).read_text(encoding="utf-8")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"unable to read target file: {e}")
+
+    before_sha = hashlib.sha256(before_text.encode("utf-8")).hexdigest()
+
+    # Validate the diff can apply cleanly (preview correctness guarantee)
+    try:
+        applied = _apply_unified_diff(before_text, diff_text)
+    except Exception as e:
+        raise HTTPException(status_code=409, detail=f"diff does not apply cleanly: {e}")
+
+    after_text = applied["patched_text"]
+    after_sha = hashlib.sha256(after_text.encode("utf-8")).hexdigest()
+
+    task_id = create_task(
+        title="Diff Apply",
+        resume_hint=json.dumps(
+            {
+                "path": path,
+                "resolved_path": resolved_path,
+                "dry_run": bool(body.dry_run),
+                "unified_diff_b64": body.unified_diff_b64,
+                "before_sha256": before_sha,
+                "after_sha256": after_sha,
+                "hunks": int(applied.get("hunks") or 0),
+                "additions": int(applied.get("additions") or 0),
+                "deletions": int(applied.get("deletions") or 0),
+            }
+        ),
+    )
+
+    add_step(
+        task_id=task_id,
+        step_index=1,
+        description=f"Created pending diff-apply task for {path} (dry_run={bool(body.dry_run)})",
+    )
+
+    add_artifact(
+        task_id=task_id,
+        step_id=None,
+        artifact_type="diff_apply_proposal",
+        metadata_json=json.dumps(
+            {
+                "path": path,
+                "dry_run": bool(body.dry_run),
+                "unified_diff_b64": body.unified_diff_b64,
+                "before_sha256": before_sha,
+                "after_sha256": after_sha,
+                "hunks": int(applied.get("hunks") or 0),
+                "additions": int(applied.get("additions") or 0),
+                "deletions": int(applied.get("deletions") or 0),
+                "diff_bytes": len(diff_raw),
+            }
+        ),
+    )
+
+    return {
+        "status": "ok",
+        "task_id": task_id,
+        "path": path,
+        "dry_run": bool(body.dry_run),
+                "unified_diff_b64": body.unified_diff_b64,
+        "before_sha256": before_sha,
+        "after_sha256": after_sha,
+        "hunks": int(applied.get("hunks") or 0),
+        "additions": int(applied.get("additions") or 0),
+        "deletions": int(applied.get("deletions") or 0),
+        "diff_bytes": len(diff_raw),
+    }
 
 @app.post(
     "/tasks/{task_id}/abort",
@@ -2824,13 +3201,97 @@ def resume_task_preview(task_id: int) -> Dict[str, Any]:
             "plan": {"action": "tooling_probe"},
         }
 
-    return {
-        "status": "ok",
-        "task_id": task_id,
-        "supported": False,
-        "message": "Resume not supported for this task type yet.",
-        "task": task,
-    }
+    if title in ("File write", "File replace"):
+        try:
+            payload = json.loads(resume_hint) if isinstance(resume_hint, str) else (resume_hint or {})
+            path = str(payload.get("path") or "").strip()
+            dry_run = bool(payload.get("dry_run", True))
+            bytes_len = int(payload.get("bytes") or 0)
+            sha256 = str(payload.get("sha256") or "")
+        except Exception:
+            path = ""
+            dry_run = True
+            bytes_len = 0
+            sha256 = ""
+    
+        if not path:
+            return {
+                "status": "ok",
+                "task_id": task_id,
+                "supported": False,
+                "message": "File Write task is missing required resume_hint fields.",
+                "task": task,
+            }
+    
+        return {
+            "status": "ok",
+            "task_id": task_id,
+            "supported": True,
+            "message": "Will replace the target file atomically (whole-file), then run HTTP auto-verify.",
+            "task": task,
+            "plan": {"action": "file_write", "path": path, "dry_run": dry_run, "bytes": bytes_len, "sha256": sha256},
+        }
+    
+    if title == "Diff Apply":
+        if not ENABLE_DIFF_APPLY:
+            return {
+                "status": "ok",
+                "task_id": task_id,
+                "supported": False,
+                "message": "Diff Apply is disabled in v5. Set ENABLE_DIFF_APPLY=1 to enable, or use File Replace tasks.",
+                "task": task,
+            }
+
+        parsed = _parse_diff_apply_resume_hint(resume_hint)
+        if not parsed:
+            return {
+                "status": "ok",
+                "task_id": task_id,
+                "supported": False,
+                "message": "Diff Apply task is missing required resume_hint fields.",
+                "task": task,
+            }
+    
+        path = parsed["path"]
+        dry_run = bool(parsed["dry_run"])
+    
+        # Pull precomputed stats if available (created at task creation time)
+        try:
+            payload = json.loads(resume_hint) if isinstance(resume_hint, str) else (resume_hint or {})
+            hunks = int(payload.get("hunks") or 0)
+            additions = int(payload.get("additions") or 0)
+            deletions = int(payload.get("deletions") or 0)
+            before_sha = str(payload.get("before_sha256") or "")
+            after_sha = str(payload.get("after_sha256") or "")
+        except Exception:
+            hunks = additions = deletions = 0
+            before_sha = after_sha = ""
+    
+        return {
+            "status": "ok",
+            "task_id": task_id,
+            "supported": True,
+            "message": "Will apply the unified diff atomically to the target file, then run HTTP auto-verify.",
+            "task": task,
+            "plan": {
+                "action": "diff_apply",
+                "path": path,
+                "dry_run": dry_run,
+                "hunks": hunks,
+                "additions": additions,
+                "deletions": deletions,
+                "before_sha256": before_sha,
+                "after_sha256": after_sha,
+            },
+        }
+    
+        return {
+            "status": "ok",
+            "task_id": task_id,
+            "supported": False,
+            "message": "Resume not supported for this task type yet.",
+            "task": task,
+        }
 
 @app.post(
     "/tasks/{task_id}/resume/plan",
@@ -2851,6 +3312,8 @@ async def resume_task(task_id: int) -> Dict[str, Any]:
     - Supports:
         * Runner FS list (v1.3)
         * Tooling probe (v2 evidence)
+        * File replace (v5 whole-file replace; preview by default)
+        * Diff apply (v4; disabled by default in v5)
     """
     if task_id < 1:
         raise HTTPException(status_code=400, detail="task_id must be >= 1")
@@ -2883,7 +3346,7 @@ async def resume_task(task_id: int) -> Dict[str, Any]:
 
     try:
         # ---- File write (v3 template) ----
-        if title == "File write":
+        if title in ("File write", "File replace"):
             proposal = _task_get_latest_artifact(task_id, "file_write_proposal")
             if not proposal:
                 raise HTTPException(status_code=400, detail="Missing file_write_proposal artifact")
@@ -2993,6 +3456,124 @@ async def resume_task(task_id: int) -> Dict[str, Any]:
                 "completed": True,
             }
 
+        # ---- Diff Apply (v4) ----
+        if title == "Diff Apply":
+            proposal = _task_get_latest_artifact(task_id, "diff_apply_proposal")
+            if not proposal:
+                raise HTTPException(status_code=400, detail="Missing diff_apply_proposal artifact")
+        
+            meta = proposal.get("metadata") or {}
+            path = str(meta.get("path") or "").strip()
+            dry_run = bool(meta.get("dry_run", True))
+            unified_diff_b64 = str(meta.get("unified_diff_b64") or "").strip()
+        
+            if not path or not unified_diff_b64:
+                raise HTTPException(status_code=400, detail="Diff Apply proposal missing required fields")
+        
+            if not _is_path_allowed(path):
+                raise HTTPException(status_code=403, detail="path not in write allowlist")
+        
+            try:
+                diff_raw = base64.b64decode(unified_diff_b64.encode("utf-8"), validate=True)
+                diff_text = diff_raw.decode("utf-8")
+            except Exception:
+                raise HTTPException(status_code=400, detail="unified_diff_b64 must be valid base64 UTF-8 diff")
+        
+            # Read current file content at execution time
+            try:
+                resolved_path = str(meta.get("resolved_path") or "").strip() or resolve_target_path(path, must_exist=True)
+                if not resolved_path:
+                    raise HTTPException(status_code=400, detail=f"unable to read target file: no such file for path '{path}'")
+                before_text = Path(resolved_path).read_text(encoding="utf-8")
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"unable to read target file: {e}")
+        
+            before_sha = hashlib.sha256(before_text.encode("utf-8")).hexdigest()
+        
+            try:
+                applied = _apply_unified_diff(before_text, diff_text)
+            except Exception as e:
+                failures_record(task_id=task_id, step_id=None, failure_class=FailureClass.WRITE.value, message=f"diff apply failed: {e}")
+                raise HTTPException(status_code=409, detail=f"diff does not apply cleanly: {e}")
+        
+            after_text = applied["patched_text"]
+            after_sha = hashlib.sha256(after_text.encode("utf-8")).hexdigest()
+        
+            next_idx = _task_next_step_index(task_id)
+            step_id = add_step(
+                task_id=task_id,
+                step_index=next_idx,
+                description=f"Resume: diff-apply → {path} (dry_run={dry_run})",
+            )
+        
+            if dry_run:
+                add_artifact(
+                    task_id=task_id,
+                    step_id=step_id,
+                    artifact_type="diff_apply_dry_run",
+                    metadata_json=json.dumps(
+                        {
+                            "path": path,
+                            "dry_run": True,
+                            "before_sha256": before_sha,
+                            "after_sha256": after_sha,
+                            "hunks": int(applied.get("hunks") or 0),
+                            "additions": int(applied.get("additions") or 0),
+                            "deletions": int(applied.get("deletions") or 0),
+                            "diff_bytes": len(diff_raw),
+                            "would_apply": True,
+                        }
+                    ),
+                )
+            else:
+                try:
+                    _atomic_write_text(path, after_text)
+                except Exception as e:
+                    failures_record(task_id=task_id, step_id=step_id, failure_class=FailureClass.WRITE.value, message=str(e))
+                    raise
+        
+                add_artifact(
+                    task_id=task_id,
+                    step_id=step_id,
+                    artifact_type="diff_apply_applied",
+                    metadata_json=json.dumps(
+                        {
+                            "path": path,
+                            "dry_run": False,
+                            "before_sha256": before_sha,
+                            "after_sha256": after_sha,
+                            "hunks": int(applied.get("hunks") or 0),
+                            "additions": int(applied.get("additions") or 0),
+                            "deletions": int(applied.get("deletions") or 0),
+                            "diff_bytes": len(diff_raw),
+                        }
+                    ),
+                )
+        
+            # Auto-verify always on (v3+)
+            verify = await _http_verify_template()
+            add_artifact(
+                task_id=task_id,
+                step_id=step_id,
+                artifact_type="verify_http",
+                metadata_json=json.dumps(verify),
+            )
+        
+            if not verify.get("ok"):
+                failures_record(task_id, step_id=step_id, failure_class=FailureClass.VERIFY.value, message="HTTP verify template failed")
+                lineage_inc_verify_failures(task_id)
+                raise HTTPException(status_code=409, detail="Verify failed; refusing to mark task completed")
+        
+            _task_update_status(task_id, "completed")
+            return {
+                "status": "ok",
+                "task_id": task_id,
+                "completed": True,
+                "action": "diff_apply",
+                "dry_run": dry_run,
+                "verify": verify,
+            }
+        
         # ---- Tooling probe (v2 evidence) ----
         if title == "Tooling probe":
             next_idx = _task_next_step_index(task_id)
@@ -4715,4 +5296,3 @@ app.include_router(
     irr_narrative_router,
     dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
 )
-
