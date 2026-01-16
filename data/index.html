@@ -1,0 +1,1256 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Alice — v6</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2064%2064%22%3E%0A%20%20%3Cpath%20fill%3D%22%23ffffff%22%20fill-rule%3D%22evenodd%22%20d%3D%22M28%2020%20A18%2016%200%201%201%2028%2052%20A18%2016%200%201%201%2028%2020%20Z%20M28%2027%20A10%209%200%201%200%2028%2045%20A10%209%200%201%200%2028%2027%20Z%20M48%2016%20H50%20A6%206%200%200%201%2056%2022%20V50%20A6%206%200%200%201%2050%2056%20H48%20A6%206%200%200%201%2042%2050%20V22%20A6%206%200%200%201%2048%2016%20Z%22/%3E%0A%3C/svg%3E" />
+  <link rel="shortcut icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2064%2064%22%3E%0A%20%20%3Cpath%20fill%3D%22%23ffffff%22%20fill-rule%3D%22evenodd%22%20d%3D%22M28%2020%20A18%2016%200%201%201%2028%2052%20A18%2016%200%201%201%2028%2020%20Z%20M28%2027%20A10%209%200%201%200%2028%2045%20A10%209%200%201%200%2028%2027%20Z%20M48%2016%20H50%20A6%206%200%200%201%2056%2022%20V50%20A6%206%200%200%201%2050%2056%20H48%20A6%206%200%200%201%2042%2050%20V22%20A6%206%200%200%201%2048%2016%20Z%22/%3E%0A%3C/svg%3E" />
+  <meta name="theme-color" content="#07080b" />
+  <meta name="color-scheme" content="dark light" />
+  <style>
+    :root{
+      --bg:#07080b;
+      --bg2:#0b0d12;
+      --panel:rgba(18,20,26,.86);
+      --panel2:rgba(30,32,40,.92);
+      --border:rgba(255,255,255,.12);
+      --border2:rgba(255,255,255,.18);
+      --text:rgba(255,255,255,.92);
+      --muted:rgba(255,255,255,.66);
+      --dim:rgba(255,255,255,.46);
+      --accent:rgba(56,189,248,.95);
+      --accent2:rgba(99,102,241,.85);
+      --warn:rgba(253,224,71,.92);
+      --ok:rgba(34,197,94,.90);
+      --bad:rgba(248,113,113,.92);
+      --shadow:0 20px 60px rgba(0,0,0,.55);
+      --r1:22px;
+      --r2:16px;
+      --r3:12px;
+      --pad:12px;
+      --font:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+      --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;
+      --max:1180px;
+    }
+
+    *{box-sizing:border-box}
+    html,body{height:100%;min-height:100dvh}
+    body{
+      margin:0;
+      font-family:var(--font);
+      color:var(--text);
+      background:
+        radial-gradient(1100px 800px at 62% 22%, rgba(56,189,248,.08), transparent 55%),
+        radial-gradient(900px 700px at 40% 78%, rgba(99,102,241,.06), transparent 60%),
+        radial-gradient(900px 700px at 18% 20%, rgba(253,224,71,.05), transparent 62%),
+        linear-gradient(180deg, var(--bg), var(--bg2));
+      overflow:hidden;
+    }
+
+    a{color:inherit}
+    button,input,textarea{font-family:inherit}
+
+    /* v6 mobile hardening */
+    input,textarea{font-size:16px}
+    .app{height:100dvh}
+
+    button{cursor:pointer}
+
+    .app{
+      height:100dvh;
+      max-width:var(--max);
+      margin:0 auto;
+      padding:10px;
+      padding-bottom:calc(10px + env(safe-area-inset-bottom));
+      display:grid;
+      grid-template-rows:auto 1fr auto;
+      gap:10px;
+    }
+
+    /* Top bar */
+    .topbar{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      border:1px solid var(--border);
+      border-radius:var(--r1);
+      background:rgba(0,0,0,.22);
+      box-shadow:var(--shadow);
+      padding:12px;
+      min-width:0;
+    }
+    .brand{
+      min-width:0;
+      display:flex;
+      flex-direction:column;
+      gap:2px;
+    }
+    .brand .title{
+      font-weight:650;
+      letter-spacing:.02em;
+      font-size:14px;
+      display:flex;
+      align-items:center;
+      gap:8px;
+      user-select:none;
+    }
+    .dot{
+      width:8px;height:8px;border-radius:50%;
+      background:rgba(255,255,255,.22);
+      box-shadow:0 0 0 4px rgba(255,255,255,.06);
+    }
+    .brand .subtitle{
+      font-size:12px;
+      color:var(--dim);
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      max-width:72ch;
+    }
+    .chiprow{
+      display:flex;
+      align-items:center;
+      gap:8px;
+      flex-wrap:wrap;
+      justify-content:flex-end;
+    }
+    .chip{
+      border:1px solid rgba(56,189,248,.35);
+      background:rgba(56,189,248,.10);
+      color:rgba(210,245,255,.95);
+      font-size:11px;
+      padding:4px 10px;
+      border-radius:999px;
+      user-select:none;
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      line-height:1;
+    }
+    .chip.warn{border-color:rgba(253,224,71,.35);background:rgba(253,224,71,.08);color:rgba(255,246,184,.95)}
+    .chip.ok{border-color:rgba(34,197,94,.35);background:rgba(34,197,94,.10);color:rgba(195,255,220,.95)}
+    .chip.bad{border-color:rgba(248,113,113,.40);background:rgba(248,113,113,.10);color:rgba(255,210,210,.95)}
+    .chip.btn{
+      cursor:pointer;
+      transition:transform .06s ease, background .18s ease, border-color .18s ease;
+    }
+    .chip.btn:hover{transform:translateY(-1px);background:rgba(56,189,248,.14)}
+    .chip.btn:active{transform:translateY(0px)}
+    .chip.btn[disabled]{opacity:.45;cursor:not-allowed}
+    .kbd{
+      font-family:var(--mono);
+      font-size:10px;
+      padding:2px 6px;
+      border:1px solid rgba(255,255,255,.18);
+      border-bottom-color:rgba(255,255,255,.10);
+      border-radius:8px;
+      background:rgba(0,0,0,.25);
+      color:rgba(255,255,255,.75);
+    }
+
+    /* Conversation */
+    .main{
+      border:1px solid var(--border);
+      border-radius:var(--r1);
+      background:rgba(0,0,0,.18);
+      box-shadow:var(--shadow);
+      overflow:hidden;
+      display:flex;
+      min-height:0;
+    }
+    .conversation{
+      flex:1;
+      display:flex;
+      flex-direction:column;
+      min-width:0;
+      min-height:0;
+    }
+    .scroll{
+      flex:1;
+      overflow:auto;
+      padding:14px;
+      scroll-behavior:smooth;
+    }
+    .scroll::-webkit-scrollbar{width:10px}
+    .scroll::-webkit-scrollbar-thumb{background:rgba(255,255,255,.10);border-radius:999px}
+    .scroll::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.14)}
+
+    .msg{
+      display:flex;
+      gap:10px;
+      margin:10px 0;
+      align-items:flex-start;
+    }
+    .avatar{
+      flex:0 0 auto;
+      width:28px;height:28px;border-radius:12px;
+      display:grid;place-items:center;
+      border:1px solid rgba(255,255,255,.14);
+      background:rgba(255,255,255,.06);
+      color:rgba(255,255,255,.82);
+      user-select:none;
+    }
+    .bubble{
+      max-width:min(760px, 100%);
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:18px;
+      padding:10px 12px;
+      background:rgba(16,18,24,.62);
+      backdrop-filter: blur(10px);
+      box-shadow:0 8px 26px rgba(0,0,0,.25);
+      line-height:1.35;
+      overflow-wrap:anywhere;
+    }
+    .msg.me{justify-content:flex-end}
+    .msg.me .bubble{
+      background:rgba(56,189,248,.10);
+      border-color:rgba(56,189,248,.22);
+    }
+    .msg.me .avatar{display:none}
+    .meta{
+      margin-top:6px;
+      font-size:11px;
+      color:var(--dim);
+    }
+    .bubble pre{
+      margin:10px 0 0;
+      padding:10px 12px;
+      border-radius:14px;
+      border:1px solid rgba(255,255,255,.12);
+      background:rgba(0,0,0,.30);
+      font-family:var(--mono);
+      font-size:12px;
+      overflow:auto;
+      max-width:100%;
+    }
+    .bubble code{font-family:var(--mono);font-size:12px}
+    .bubble h4{
+      font-size:12px;
+      color:rgba(255,255,255,.80);
+      font-weight:650;
+      letter-spacing:.02em;
+      margin:0 0 8px 0;
+      text-transform:uppercase;
+    }
+
+    /* Inline cards (Plan/Patch/Result/Summary only) */
+    .card{
+      margin-top:10px;
+      border:1px solid rgba(255,255,255,.14);
+      border-radius:16px;
+      background:rgba(0,0,0,.18);
+      padding:10px 12px;
+    }
+    .card .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between}
+    .card .hint{font-size:12px;color:var(--muted)}
+    .card .actions{display:flex;gap:8px;flex-wrap:wrap}
+    .btn{
+      border:1px solid rgba(255,255,255,.16);
+      background:rgba(255,255,255,.06);
+      color:rgba(255,255,255,.88);
+      padding:8px 10px;
+      border-radius:12px;
+      font-size:12px;
+      line-height:1;
+      transition:transform .06s ease, background .18s ease, border-color .18s ease;
+      user-select:none;
+    }
+    .btn:hover{transform:translateY(-1px);background:rgba(255,255,255,.08)}
+    .btn:active{transform:translateY(0)}
+    .btn.primary{border-color:rgba(56,189,248,.30);background:rgba(56,189,248,.12)}
+    .btn.danger{border-color:rgba(248,113,113,.38);background:rgba(248,113,113,.12)}
+    .btn.ghost{background:transparent}
+    .btn[disabled]{opacity:.45;cursor:not-allowed}
+    /* Composer (ChatGPT-like: clean, big, no extra hints) */
+    .composer{
+      border:1px solid var(--border);
+      border-radius:var(--r1);
+      background:rgba(0,0,0,.20);
+      box-shadow:var(--shadow);
+      padding:10px;
+      padding-bottom:calc(10px + env(safe-area-inset-bottom));
+      display:flex;
+      gap:10px;
+      align-items:flex-end;
+      min-height:64px;
+    }
+    .inputwrap{
+      flex:1;
+      display:flex;
+      align-items:flex-end;
+      gap:10px;
+      border:1px solid rgba(255,255,255,.14);
+      background:rgba(0,0,0,.22);
+      border-radius:18px;
+      padding:10px 12px;
+      min-height:56px;
+    }
+    textarea{
+      width:100%;
+      border:none;
+      outline:none;
+      resize:none;
+      background:transparent;
+      color:var(--text);
+      font-size:16px;
+      line-height:1.35;
+      min-height:32px;
+      max-height:220px;
+      -webkit-text-size-adjust:100%;
+    }
+    textarea::placeholder{color:rgba(255,255,255,.40)}
+    .send{
+      flex:0 0 auto;
+      height:44px;
+      min-width:76px;
+      padding:0 16px;
+      border-radius:14px;
+      border:1px solid rgba(56,189,248,.30);
+      background:rgba(56,189,248,.14);
+      color:rgba(230,250,255,.95);
+      font-size:13px;
+      line-height:1;
+    }
+    .send[disabled]{opacity:.45;cursor:not-allowed}
+
+    @media (max-width: 520px){
+      .composer{padding:10px;border-radius:18px;}
+      .inputwrap{min-height:58px;}
+      .send{min-width:68px;height:42px;padding:0 14px;border-radius:13px;}
+    }
+    /* Tasks overlay (Option B: only on explicit request) */
+    .overlay{
+      position:fixed;
+      inset:0;
+      background:rgba(0,0,0,.45);
+      display:none;
+      align-items:stretch;
+      justify-content:flex-end;
+      z-index:50;
+    }
+    .overlay.open{display:flex}
+    .sheet{
+      width:min(520px, 100%);
+      height:100%;
+      background:var(--panel2);
+      border-left:1px solid var(--border);
+      box-shadow:var(--shadow);
+      display:flex;
+      flex-direction:column;
+      transform:translateX(0%);
+    }
+    @media (max-width: 720px){
+      .sheet{
+        width:100%;
+        border-left:none;
+      }
+    }
+    .sheetheader{
+      padding:12px;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      border-bottom:1px solid rgba(255,255,255,.10);
+      background:rgba(0,0,0,.18);
+    }
+    .sheetheader .left{
+      display:flex;
+      flex-direction:column;
+      gap:3px;
+      min-width:0;
+    }
+    .sheetheader .left strong{
+      font-size:13px;
+      letter-spacing:.02em;
+    }
+    .sheetheader .left span{
+      font-size:11px;
+      color:var(--dim);
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      max-width:54ch;
+    }
+    .sheetbody{
+      flex:1;
+      overflow:auto;
+      padding:12px;
+      display:flex;
+      flex-direction:column;
+      gap:10px;
+    }
+    .task{
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:16px;
+      background:rgba(0,0,0,.16);
+      padding:10px 12px;
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    .task .top{
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap:10px;
+    }
+    .task .name{
+      font-size:13px;
+      font-weight:650;
+      letter-spacing:.01em;
+      line-height:1.25;
+    }
+    .task .small{
+      font-size:11px;color:var(--dim);
+      line-height:1.2;
+    }
+    .task .status{
+      font-size:11px;
+      padding:4px 10px;
+      border-radius:999px;
+      border:1px solid rgba(255,255,255,.14);
+      background:rgba(255,255,255,.06);
+      color:rgba(255,255,255,.80);
+      white-space:nowrap;
+      user-select:none;
+    }
+    .status.pending{border-color:rgba(253,224,71,.26);background:rgba(253,224,71,.08);color:rgba(255,246,184,.95)}
+    .status.running{border-color:rgba(56,189,248,.26);background:rgba(56,189,248,.10);color:rgba(210,245,255,.95)}
+    .status.done{border-color:rgba(34,197,94,.28);background:rgba(34,197,94,.10);color:rgba(195,255,220,.95)}
+    .status.failed{border-color:rgba(248,113,113,.30);background:rgba(248,113,113,.10);color:rgba(255,210,210,.95)}
+    .task .actions{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      align-items:center;
+      justify-content:flex-end;
+    }
+    .divider{
+      height:1px;
+      background:rgba(255,255,255,.10);
+      margin:4px 0;
+    }
+    .empty{
+      border:1px dashed rgba(255,255,255,.18);
+      border-radius:16px;
+      padding:14px;
+      color:var(--muted);
+      background:rgba(0,0,0,.12);
+      font-size:12px;
+      line-height:1.35;
+    }
+
+    /* Toast */
+    .toast{
+      position:fixed;
+      left:50%;
+      bottom:16px;
+      transform:translateX(-50%);
+      z-index:70;
+      max-width:min(740px, calc(100% - 20px));
+      border:1px solid rgba(255,255,255,.14);
+      background:rgba(12,14,18,.86);
+      backdrop-filter: blur(10px);
+      border-radius:16px;
+      padding:10px 12px;
+      box-shadow:var(--shadow);
+      display:none;
+      gap:10px;
+      align-items:flex-start;
+    }
+    .toast.show{display:flex}
+    .toast .t{
+      flex:1;
+      font-size:12px;
+      color:rgba(255,255,255,.86);
+      line-height:1.35;
+    }
+    .toast .x{
+      border:none;
+      background:transparent;
+      color:rgba(255,255,255,.70);
+      font-size:18px;
+      line-height:1;
+      padding:0 4px;
+    }
+
+    /* Focus */
+    :focus-visible{
+      outline:2px solid rgba(56,189,248,.55);
+      outline-offset:2px;
+      border-radius:12px;
+    }
+
+  </style>
+</head>
+
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="title"><span class="dot" id="healthDot"></span> Alice</div>
+        <div class="subtitle" id="subtitle">Conversation-first. Tasks only appear when you ask.</div>
+      </div>
+
+      <div class="chiprow">
+        <div class="chip" id="healthChip">Backend: unknown</div>
+
+        <!-- Optional, non-authoritative indicator (allowed) -->
+        <button class="chip btn" id="tasksChip" type="button" title="Show tasks (or type: show tasks)">
+          Tasks <span id="tasksCount" class="kbd">0</span>
+        </button>
+
+        <button class="chip btn warn" id="adminChip" type="button" title="Unlock admin (or type: unlock admin)">
+          Admin <span id="adminState" class="kbd">locked</span>
+        </button>
+      </div>
+    </header>
+
+    <main class="main">
+      <section class="conversation" aria-label="Conversation">
+        <div class="scroll" id="scroll">
+          <!-- Seed greeting -->
+        </div>
+      </section>
+    </main>
+
+    <footer class="composer" aria-label="Message composer">
+      <div class="inputwrap">
+        <textarea id="input" rows="1" placeholder="Message Alice…"></textarea>
+        <button class="send" id="sendBtn" type="button">Send</button>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Tasks overlay (hidden unless explicitly requested) -->
+  <div class="overlay" id="tasksOverlay" role="dialog" aria-modal="true" aria-label="Tasks">
+    <div class="sheet" role="document">
+      <div class="sheetheader">
+        <div class="left">
+          <strong>Tasks</strong>
+          <span id="tasksSubtitle">Loaded on request. No background polling.</span>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <button class="btn" id="refreshTasksBtn" type="button">Refresh</button>
+          <button class="btn ghost" id="closeTasksBtn" type="button">Close</button>
+        </div>
+      </div>
+      <div class="sheetbody" id="tasksBody">
+        <div class="empty">Say “show tasks” to open this panel. Tasks do not compete with conversation for authority.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Simple toast -->
+  <div class="toast" id="toast" role="status" aria-live="polite">
+    <div class="t" id="toastText"></div>
+    <button class="x" id="toastClose" type="button" aria-label="Close">×</button>
+  </div>
+
+  <script>
+    // v6: Base API key is REQUIRED for every request (locked or unlocked).
+    // Hardcode it here on the server (do not commit the real value).
+    // This must ALWAYS be sent as X-API-Key; admin token is additive only.
+    const BASE_API_KEY = "352400eb0c42ef1e4c14ddcd643f77ebf50da2f394b3ca0707f16018cd884f26";
+    // IMPORTANT: This must always be sent as X-API-Key on every request.
+    // Locking admin must NEVER clear or change this value.
+
+// -------------------------
+    // Config
+    // -------------------------
+    // Keep endpoints relative; NPM routes / to UI, /ask to backend, /tasks to backend
+    const API = {
+      ask: "/ask",
+      health: "/health",
+      tasks_list: "/tasks",
+      task_get: (id) => `/tasks/${id}`,
+      task_resume: (id) => `/tasks/${id}/resume`,
+      task_abort: (id) => `/tasks/${id}/abort`,
+      admin_unlock: "/auth/admin/unlock", // v4 backend
+            admin_lock: "/auth/admin/lock" // v4 backend (fallback handled client-side)
+    };
+
+    // Persistent admin key (hidden in UI, but present in served source).
+    // Set this once in the file to your real X-ISAC-ADMIN-KEY value.
+    // IMPORTANT: This key is only sent after a successful PIN unlock (session-only).
+        // Persistent admin key is NOT used in v4. Admin is unlocked via short-lived token only.
+    // Intentionally blank to avoid embedding secrets in the client.
+    const PERSISTENT_ADMIN_KEY = "";
+
+
+
+
+    // State (session only)
+    const state = {
+      adminUnlocked: false,
+      adminUnlockHintShown: false,
+      lastTasks: [],
+      lastHealthOk: null,
+      lastAskInFlight: false,
+      adminToken: null // session-only, never persisted
+    };
+
+    // -------------------------
+    // Utilities
+    // -------------------------
+    const $ = (id) => document.getElementById(id);
+
+    function getBaseApiKey(){
+      // Base API key is non-negotiable: it must be sent on EVERY request (locked or unlocked).
+      // This value is expected to be injected at deploy time; keep placeholder out of production.
+      const k = (BASE_API_KEY || '').trim();
+      if(!k || k === 'PASTE_YOUR_BASE_API_KEY_HERE'){
+        return '';
+      }
+      return k;
+    }
+
+    function nowTime(){
+      const d = new Date();
+      return d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
+    }
+
+    function escapeHtml(s){
+      return (s ?? "").toString()
+        .replaceAll("&","&amp;")
+        .replaceAll("<","&lt;")
+        .replaceAll(">","&gt;")
+        .replaceAll('"',"&quot;")
+        .replaceAll("'","&#039;");
+    }
+
+
+    // -------------------------
+    // Alice mediation (ISAC must never speak to the user)
+    // -------------------------
+    function mediateAssistantReply(raw){
+      let s = (raw ?? "").toString().trim();
+      if(!s) return s;
+
+      // If there's no ISAC mention, keep as-is.
+      if(!/\bISAC\b/i.test(s)) return s;
+
+      // Remove common identity leak fragments/sentences.
+      s = s
+        .replace(/\bhello!\s*/i, "Hello! ")
+        .replace(/\b(i\s*(?:'m|\s+am)\s+isac\b[^.?!]*[.?!]?\s*)/ig, "")
+        .replace(/\b(your\s+helpful\s+assistant\b[^.?!]*[.?!]?\s*)/ig, "")
+        .replace(/\b(it\s+seems\s+you\s+called\s+me\s+alice[^.?!]*[.?!])\s*/ig, "")
+        .replace(/\b(but\s+)?i\s*(?:'m|\s+am)\s+not\s+alice\b[^.?!]*[.?!]?\s*/ig, "")
+        .replace(/\b(it\s+seems\s+you\s+might\s+have\s+mistaken\s+me\s+for\s+someone\s+else\b[^.?!]*[.?!]?\s*)/ig, "")
+        .trim();
+
+      // Drop any remaining sentences that mention ISAC.
+      if(/\bISAC\b/i.test(s)){
+        const parts = s.split(/(?<=[.!?])\s+/);
+        const kept = parts.filter(p => !/\bISAC\b/i.test(p));
+        s = (kept.join(" ").trim()) || "";
+      }
+
+      // If we stripped everything, return canonical Alice identity (ISAC must remain silent).
+      if(!s) return "You’re talking to Alice. How can I help you today?";
+
+      return s;
+    }
+
+
+    function scrollToBottom(){
+      const el = $("scroll");
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function toast(msg){
+      $("toastText").textContent = msg;
+      $("toast").classList.add("show");
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => $("toast").classList.remove("show"), 3800);
+    }
+
+    $("toastClose").addEventListener("click", () => $("toast").classList.remove("show"));
+
+    // -------------------------
+    // Conversation rendering
+    // -------------------------
+    function addMessage(role, html, meta=null){
+      const wrap = document.createElement("div");
+      wrap.className = "msg" + (role === "me" ? " me" : "");
+      const avatar = document.createElement("div");
+      avatar.className = "avatar";
+      avatar.textContent = role === "me" ? "" : "A";
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.innerHTML = html;
+
+      if(meta){
+        const m = document.createElement("div");
+        m.className = "meta";
+        m.textContent = meta;
+        bubble.appendChild(m);
+      }
+
+      if(role !== "me") wrap.appendChild(avatar);
+      wrap.appendChild(bubble);
+
+      $("scroll").appendChild(wrap);
+      scrollToBottom();
+      return bubble;
+    }
+
+    function addAliceText(text){
+      return addMessage("alice", `<div>${escapeHtml(text).replaceAll("\n","<br>")}</div>`, nowTime());
+    }
+
+    function addMeText(text){
+      return addMessage("me", `<div>${escapeHtml(text).replaceAll("\n","<br>")}</div>`, nowTime());
+    }
+
+    // Cards are *announced in language* and are reference artifacts only.
+    function addCard(type, title, bodyHtml, actions=[]) {
+      const safeTitle = escapeHtml(title);
+      const safeType = escapeHtml(type);
+      const actionHtml = actions.map(a => {
+        const cls = a.kind ? `btn ${a.kind}` : "btn";
+        const disabled = a.disabled ? "disabled" : "";
+        const aid = escapeHtml(a.id);
+        const label = escapeHtml(a.label);
+        return `<button class="${cls}" id="${aid}" type="button" ${disabled}>${label}</button>`;
+      }).join("");
+
+      const card = `
+        <div class="card" data-card-type="${safeType}">
+          <h4>${safeType}</h4>
+          <div class="row">
+            <div style="min-width:0;">
+              <div style="font-size:13px;font-weight:650;letter-spacing:.01em;margin-bottom:4px;">${safeTitle}</div>
+              <div class="hint">${bodyHtml}</div>
+            </div>
+            <div class="actions">${actionHtml}</div>
+          </div>
+        </div>
+      `;
+      const bubble = addMessage("alice", `<div>${card}</div>`, nowTime());
+      return bubble;
+    }
+
+    // -------------------------
+    // Health
+    // -------------------------
+    async function checkHealth(){
+      try{
+        const r = await fetch(API.health, {method:"GET"});
+        if(!r.ok){ const err = new Error(`HTTP ${r.status}`); err.status = r.status; throw err; }
+        state.lastHealthOk = true;
+        $("healthChip").textContent = "Backend: ok";
+        $("healthChip").className = "chip ok";
+        $("healthDot").style.background = "rgba(34,197,94,.90)";
+      }catch(e){
+        state.lastHealthOk = false;
+        $("healthChip").textContent = "Backend: offline";
+        $("healthChip").className = "chip bad";
+        $("healthDot").style.background = "rgba(248,113,113,.92)";
+      }
+    }
+
+    // -------------------------
+    // Admin unlock (conversational)
+    // -------------------------
+
+    // -------------------------
+    // Admin unlock (conversational)
+    // -------------------------
+
+    function showAdminUnlockCard(){
+      addAliceText("Admin is locked. I can show an unlock card. Password never persists, and unlock is session-only.");
+      const body = `
+        <div>Enter your admin password to unlock this session.</div>
+        <div style="margin-top:10px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+          <input id="adminPassInput" type="password" placeholder="Admin password" 
+                 style="flex:1; min-width:200px; padding:10px 12px; border-radius:12px; border:1px solid rgba(255,255,255,.14);
+                        background:rgba(0,0,0,.22); color:rgba(255,255,255,.92); outline:none;" />
+          <button class="btn primary" id="adminUnlockSubmit" type="button">Unlock</button>
+          <button class="btn" id="adminUnlockCancel" type="button">Cancel</button>
+        </div>
+        <div style="margin-top:8px; font-size:11px; color:rgba(255,255,255,.52);">
+          Tip: you can also type <span class="kbd">lock admin</span> later to re-lock.
+        </div>
+      `;
+      addCard("Plan", "Conversational admin unlock", body, []);
+
+      // Wire after DOM paint
+      setTimeout(() => {
+        const inp = document.getElementById("adminPassInput");
+        const submit = document.getElementById("adminUnlockSubmit");
+        const cancel = document.getElementById("adminUnlockCancel");
+        if(!inp || !submit || !cancel) return;
+
+        const doUnlock = async () => {
+          const pass = inp.value || "";
+          if(!pass){ toast("Enter a password."); inp.focus(); return; }
+
+          submit.disabled = true;
+          try{
+            const r = await fetch(API.admin_unlock, {
+              method:"POST",
+              headers: authHeaders({"Content-Type":"application/json"}),
+              body: JSON.stringify({ pin: pass })
+            });
+            if(!r.ok){
+              const t = await safeReadText(r);
+              throw new Error(t || `HTTP ${r.status}`);
+            }
+            // Backend returns session admin key or sets server session; for our UI we store key if provided
+            let data = null;
+            try{ data = await r.json(); }catch(_){}
+            // Store short-lived admin token (session-only). Backend may return {token} or similar.
+            if(data){
+              state.adminToken = data.token || data.admin_token || data.session_token || data.session || state.adminToken;
+            }
+            // If backend sets token via HttpOnly cookie, state.adminToken may be null and that is OK.
+            state.adminUnlocked = true;
+            state.adminUnlockHintShown = false;
+            $("adminState").textContent = "unlocked";
+            toast("Admin unlocked (session-only).");
+            addAliceText("Admin unlocked for this session.");
+          }catch(e){
+            state.adminUnlocked = false;
+      state.adminUnlockHintShown = false;
+            state.adminToken = null;
+            $("adminState").textContent = "locked";
+            toast("Unlock failed.");
+            addAliceText("Unlock failed. Admin remains locked.");
+          }finally{
+            submit.disabled = false;
+          }
+        };
+
+        submit.addEventListener("click", doUnlock);
+        cancel.addEventListener("click", () => {
+          addAliceText("Okay. Admin remains locked.");
+          inp.value = "";
+        });
+        inp.addEventListener("keydown", (ev) => {
+          if(ev.key === "Enter"){
+            ev.preventDefault();
+            doUnlock();
+          }
+        });
+        inp.focus();
+      }, 0);
+    }
+
+    async function lockAdmin(){
+      // Best-effort server lock; always clear local session state.
+      try{
+        let r = await fetch(API.admin_lock, { method:"POST", headers: authHeaders() });
+        if(!r.ok){
+          // Back-compat fallback
+          await fetch("/admin/lock", { method:"POST", headers: authHeaders() }).catch(()=>{});
+        }
+      }catch(_){}
+      state.adminUnlocked = false;
+      state.adminUnlockHintShown = false;
+      state.adminToken = null;
+      $("adminState").textContent = "locked";
+      addAliceText("Admin locked.");
+      toast("Admin locked.");
+    }
+
+    function authHeaders(extra={}){
+      // v6 auth invariant:
+      // - Always send base API key for all backend calls.
+      // - Only send admin token when explicitly unlocked (token is additive).
+      const h = { ...extra };
+
+      // Base API key (always)
+      const baseKey = getBaseApiKey();
+      h["X-API-Key"] = baseKey;
+      if(!baseKey){
+        // If we ever reach the backend without a base key, fail loudly in UI.
+        console.warn('BASE_API_KEY is not set. Edit index.html and set BASE_API_KEY to your real key.');
+      }
+
+      // Admin token (session-only, only when unlocked)
+      if(state.adminUnlocked && state.adminToken){
+        h["X-ISAC-ADMIN-TOKEN"] = state.adminToken;
+      }
+      return h;
+    }
+
+    async function safeReadText(resp){
+      try{ return await resp.text(); }catch(_){ return ""; }
+    }
+
+    // -------------------------
+    // Tasks (loaded on request only)
+    // -------------------------
+    function openTasksOverlay(){
+      $("tasksOverlay").classList.add("open");
+      document.body.style.overflow = "hidden";
+    }
+    function closeTasksOverlay(){
+      $("tasksOverlay").classList.remove("open");
+      document.body.style.overflow = "";
+    }
+    $("closeTasksBtn").addEventListener("click", closeTasksOverlay);
+    $("tasksOverlay").addEventListener("click", (e) => {
+      if(e.target === $("tasksOverlay")) closeTasksOverlay();
+    });
+    document.addEventListener("keydown", (e) => {
+      if(e.key === "Escape" && $("tasksOverlay").classList.contains("open")){
+        closeTasksOverlay();
+      }
+    });
+
+    function setTasksIndicator(count){
+      $("tasksCount").textContent = String(count ?? 0);
+    }
+
+    function formatStatus(s){
+      const x = (s || "unknown").toLowerCase();
+      if(["pending","queued"].includes(x)) return "pending";
+      if(["running","in_progress","executing"].includes(x)) return "running";
+      if(["success","succeeded","done","complete","completed"].includes(x)) return "done";
+      if(["failed","error","aborted","cancelled","canceled"].includes(x)) return "failed";
+      return "unknown";
+    }
+
+    function taskTitle(t){
+      return t.title || t.name || `Task #${t.id}`;
+    }
+
+    function renderTasks(tasks){
+      state.lastTasks = Array.isArray(tasks) ? tasks : [];
+      setTasksIndicator(state.lastTasks.length);
+
+      const body = $("tasksBody");
+      body.innerHTML = "";
+
+      if(!state.lastTasks.length){
+        const d = document.createElement("div");
+        d.className = "empty";
+        d.textContent = "No tasks found.";
+        body.appendChild(d);
+        return;
+      }
+
+      state.lastTasks
+        .slice()
+        .sort((a,b)=> (b.id||0)-(a.id||0))
+        .forEach(t => {
+          const div = document.createElement("div");
+          div.className = "task";
+
+          const st = formatStatus(t.status);
+          const statusClass = `status ${st === "unknown" ? "" : st}`;
+          const when = t.updated_at || t.created_at || "";
+          const subtitle = when ? `Updated: ${when}` : (t.created_at ? `Created: ${t.created_at}` : "");
+
+          div.innerHTML = `
+            <div class="top">
+              <div style="min-width:0;">
+                <div class="name">${escapeHtml(taskTitle(t))}</div>
+                <div class="small">ID: ${escapeHtml(t.id)}${subtitle ? " · " + escapeHtml(subtitle) : ""}</div>
+              </div>
+              <div class="${statusClass}">${escapeHtml(st)}</div>
+            </div>
+            <div class="actions">
+              <button class="btn" data-action="details" data-id="${escapeHtml(t.id)}">Details</button>
+              <button class="btn primary" data-action="resume" data-id="${escapeHtml(t.id)}">Resume</button>
+              <button class="btn danger" data-action="abort" data-id="${escapeHtml(t.id)}">Abort</button>
+            </div>
+          `;
+          body.appendChild(div);
+        });
+
+      // wire actions
+      body.querySelectorAll("button[data-action]").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          const id = btn.getAttribute("data-id");
+          const action = btn.getAttribute("data-action");
+          if(!id) return;
+
+          if(action === "details"){
+            await showTaskDetails(id);
+          }else if(action === "resume"){
+            await doTaskResume(id);
+          }else if(action === "abort"){
+            await doTaskAbort(id);
+          }
+        });
+      });
+    }
+
+    async function loadTasks({announce=false, open=false} = {}){
+    try{
+        const r = await fetch(API.tasks_list, {method:"GET", headers: authHeaders()});
+        if(!r.ok){ const err = new Error(`HTTP ${r.status}`); err.status = r.status; throw err; }
+        const data = await r.json();
+        // Accept either {tasks:[...]} or [...]
+        const tasks = Array.isArray(data) ? data : (data.tasks || []);
+        renderTasks(tasks);
+        if(open) openTasksOverlay();
+        if(announce) addAliceText(`Loaded ${tasks.length} task(s).`);
+      
+      }catch(e){
+        setTasksIndicator(0);
+
+        const status = e && typeof e.status === "number" ? e.status : null;
+
+        if(status === 401){
+          // Expected: tasks are admin-gated
+          if(announce){
+            addAliceText("Tasks are admin-gated. Unlock admin to view them.");
+          }
+          toast("Admin unlock required for tasks.");
+          $("tasksBody").innerHTML = `<div class="empty">
+            Tasks are locked. Type <span class="kbd">unlock admin</span> to unlock, then try <span class="kbd">show tasks</span> again.
+          </div>`;
+          if(open) openTasksOverlay();
+          // Offer unlock card once per request flow
+          if(!state.adminUnlockHintShown){
+            state.adminUnlockHintShown = true;
+            showAdminUnlockCard();
+          }
+          return;
+        }
+
+        if(announce) addAliceText("I couldn't load tasks right now.");
+        toast("Tasks load failed.");
+        $("tasksBody").innerHTML = `<div class="empty">Tasks load failed. Confirm /tasks is routed through NPM and backend is healthy.</div>`;
+      }
+    }
+
+    async function showTaskDetails(id){
+      try{
+        const r = await fetch(API.task_get(id), {method:"GET", headers: authHeaders()});
+        if(!r.ok){ const err = new Error(`HTTP ${r.status}`); err.status = r.status; throw err; }
+        const data = await r.json();
+        const pretty = escapeHtml(JSON.stringify(data, null, 2));
+        addAliceText(`Showing details for task ${id} in the conversation (reference only).`);
+        addMessage("alice", `<div><pre>${pretty}</pre></div>`, nowTime());
+      }catch(e){
+        addAliceText(`Couldn't load details for task ${id}.`);
+        toast("Task details failed.");
+      }
+    }
+
+    async function doTaskResume(id){
+      // Requires admin
+      if(!state.adminUnlocked){
+        addAliceText("Resume is admin-gated. Unlock admin first, then retry.");
+        showAdminUnlockCard();
+        return;
+      }
+      addAliceText(`Resuming task ${id}. I will report the result here.`);
+      try{
+        const r = await fetch(API.task_resume(id), {method:"POST", headers: authHeaders({"Content-Type":"application/json"}), body: JSON.stringify({})});
+        if(!r.ok){
+          const t = await safeReadText(r);
+          const err = new Error(t || `HTTP ${r.status}`);
+          err.status = r.status;
+          throw err;
+        }
+        const data = await r.json().catch(()=>null);
+        addAliceText(`Task ${id} resume request accepted.`);
+        if(data) addMessage("alice", `<div><pre>${escapeHtml(JSON.stringify(data,null,2))}</pre></div>`, nowTime());
+        // Refresh tasks on-demand (still user initiated via this action)
+        await loadTasks({announce:false, open:false});
+      }catch(e){
+        addAliceText(`Task ${id} resume failed.`);
+        toast("Resume failed.");
+      }
+    }
+
+    async function doTaskAbort(id){
+      // Requires admin
+      if(!state.adminUnlocked){
+        addAliceText("Abort is admin-gated. Unlock admin first, then retry.");
+        showAdminUnlockCard();
+        return;
+      }
+      addAliceText(`Aborting task ${id}.`);
+      try{
+        const r = await fetch(API.task_abort(id), {method:"POST", headers: authHeaders({"Content-Type":"application/json"}), body: JSON.stringify({})});
+        if(!r.ok){
+          const t = await safeReadText(r);
+          const err = new Error(t || `HTTP ${r.status}`);
+          err.status = r.status;
+          throw err;
+        }
+        const data = await r.json().catch(()=>null);
+        addAliceText(`Task ${id} abort request accepted.`);
+        if(data) addMessage("alice", `<div><pre>${escapeHtml(JSON.stringify(data,null,2))}</pre></div>`, nowTime());
+        await loadTasks({announce:false, open:false});
+      }catch(e){
+        addAliceText(`Task ${id} abort failed.`);
+        toast("Abort failed.");
+      }
+    }
+
+    // Buttons
+    $("tasksChip").addEventListener("click", async () => {
+      // Explicit request; load tasks and open overlay
+      await loadTasks({announce:true, open:true});
+    });
+    $("refreshTasksBtn").addEventListener("click", async () => {
+      await loadTasks({announce:false, open:false});
+      toast("Tasks refreshed.");
+    });
+
+    // -------------------------
+    // Ask / Conversation commands
+    // -------------------------
+    function parseCommand(text){
+      const t = (text || "").trim().toLowerCase();
+
+      // Commands handled locally (do not go to backend)
+      const cmd = { isCmd: false, kind: null };
+
+      if(t === "show tasks" || t === "tasks" || t === "open tasks"){
+        cmd.isCmd = true; cmd.kind = "show_tasks";
+      } else if(t === "unlock admin" || t === "admin unlock"){
+        cmd.isCmd = true; cmd.kind = "unlock_admin";
+      } else if(t === "lock admin" || t === "admin lock"){
+        cmd.isCmd = true; cmd.kind = "lock_admin";
+      } else if(t === "help"){
+        cmd.isCmd = true; cmd.kind = "help";
+      } else if(
+        t === "who am i talking to" ||
+        t === "who am i talking to?" ||
+        t === "who are you" ||
+        t === "who are you?" ||
+        t === "what's your name" ||
+        t === "what is your name" ||
+        t === "what's your name?" ||
+        t === "what is your name?"
+      ){
+        cmd.isCmd = true; cmd.kind = "identity";
+      }
+
+      return cmd;
+    }
+
+    function helpText(){
+      return [
+        "Commands I can handle locally:",
+        "• show tasks  (opens tasks panel and fetches once)",
+        "• unlock admin / lock admin",
+        "• help",
+        "",
+        "Everything else goes to the backend (/ask)."
+      ].join("\n");
+    }
+
+    async function sendAsk(text){
+      if(state.lastAskInFlight) return;
+      state.lastAskInFlight = true;
+      $("sendBtn").disabled = true;
+
+      try{
+        const r = await fetch(API.ask, {
+          method:"POST",
+          headers: authHeaders({"Content-Type":"application/json"}),
+          body: JSON.stringify({ message: text })
+        });
+        if(!r.ok){
+          const t = await safeReadText(r);
+          const err = new Error(t || `HTTP ${r.status}`);
+          err.status = r.status;
+          throw err;
+        }
+        const data = await r.json().catch(()=>null);
+        const reply = data && (data.reply || data.response || data.answer) ? (data.reply || data.response || data.answer) : "";
+        const mediated = mediateAssistantReply(reply);
+        if(mediated){
+          addMessage("alice", `<div>${escapeHtml(mediated).replaceAll("\n","<br>")}</div>`, nowTime());
+        }else{
+          addAliceText("I got a response, but it didn't include a reply field.");
+        }
+      }catch(e){
+        const status = e && typeof e.status === 'number' ? e.status : null;
+        if(status === 401){
+          addAliceText('That request was rejected (401). This almost always means the base API key header (X-API-Key) was missing or invalid.');
+          toast('Unauthorized (401).');
+        }else if(status === 403){
+          addAliceText('That request was forbidden (403).');
+          toast('Forbidden (403).');
+        }else{
+          addAliceText("I couldn't reach the backend for that request.");
+          toast('Ask failed.');
+        }
+      }finally{
+        state.lastAskInFlight = false;
+        $("sendBtn").disabled = false;
+      }
+    }
+
+    async function onSend(){
+      const text = $("input").value;
+      if(!text.trim()) return;
+
+      // Local echo
+      addMeText(text.trim());
+      $("input").value = "";
+      autosize($("input"));
+
+      const cmd = parseCommand(text);
+      if(cmd.isCmd){
+        if(cmd.kind === "show_tasks"){
+          addAliceText("Opening tasks. This fetches once, only because you asked.");
+          await loadTasks({announce:false, open:true});
+        }else if(cmd.kind === "unlock_admin"){
+          showAdminUnlockCard();
+        }else if(cmd.kind === "lock_admin"){
+          await lockAdmin();
+        }else if(cmd.kind === "help"){
+          addAliceText(helpText());
+        }else if(cmd.kind === "identity"){
+          addAliceText("You\u2019re talking to Alice.");
+        }
+        return;
+      }
+
+      // Otherwise pass through to backend
+      await sendAsk(text.trim());
+    }
+
+    $("sendBtn").addEventListener("click", onSend);
+
+    $("input").addEventListener("keydown", (e) => {
+      if(e.key === "Enter" && !e.shiftKey){
+        e.preventDefault();
+        onSend();
+      }
+    });
+
+    // Autosize textarea
+    function autosize(el){
+      el.style.height = "auto";
+      el.style.height = Math.min(el.scrollHeight, 220) + "px";
+    }
+    $("input").addEventListener("input", () => autosize($("input")));
+
+    // -------------------------
+    // Boot
+    // -------------------------
+    function bootGreeting(){
+      addAliceText("Hello. Conversation is the authority spine here.");
+      addAliceText("If you want tasks, ask explicitly: “show tasks”.");
+      addAliceText("If you need admin actions like resume/abort, say: “unlock admin”.");
+    }
+
+    async function boot(){
+      bootGreeting();
+      await checkHealth();
+      // No background polling. Health is a single check on load.
+      setTasksIndicator(0);
+      $("adminState").textContent = "locked";
+    }
+
+    boot();
+  </script>
+</body>
+</html>
