@@ -345,6 +345,43 @@ def create_memory_concept(
         return {"item": row}
 
 
+
+
+@router.delete("/concepts/{concept_id}")
+def delete_memory_concept(
+    concept_id: int,
+    x_isac_admin_key: Optional[str] = Header(default=None),
+    x_isac_readonly_key: Optional[str] = Header(default=None),
+):
+    """
+    Admin-only concept deletion (forget).
+
+    Deletes aliases that reference the concept (memory_aliases.concept_id),
+    then deletes the concept row (memory_concepts.concept_id).
+
+    Returns counts so the Memory Test can prove deletion occurred.
+    """
+    _require_admin(x_isac_admin_key, x_isac_readonly_key)
+
+    with _connect() as conn:
+        # Delete aliases first (avoid FK constraints if present).
+        cur_a = conn.execute("DELETE FROM memory_aliases WHERE concept_id = ?", (concept_id,))
+        alias_rows = int(cur_a.rowcount or 0)
+
+        # Delete concept.
+        cur_c = conn.execute("DELETE FROM memory_concepts WHERE concept_id = ?", (concept_id,))
+        concept_rows = int(cur_c.rowcount or 0)
+
+        conn.commit()
+
+    return {
+        "ok": True,
+        "deleted": {
+            "concept_id": concept_id,
+            "concept_rows": concept_rows,
+            "alias_rows": alias_rows,
+        },
+    }
 @router.get("/aliases")
 def get_memory_aliases(
     x_isac_admin_key: Optional[str] = Header(default=None),

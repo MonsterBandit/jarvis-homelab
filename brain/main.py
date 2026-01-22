@@ -61,6 +61,89 @@ from services.mealplans import router as mealplans_router
 from services.mealplanner import router as mealplanner_context_router
 # Alice (Phase 8) — read-only preview endpoint (NOT wired into /ask)
 from alice_preview_router import router as alice_router
+
+# --- Alice v2 Advance Gate Router (minimal, fail-closed) ---
+from fastapi import APIRouter
+from pydantic import BaseModel
+from typing import Any, Dict, List, Optional
+
+alice_gate_router = APIRouter(prefix="/alice/gate", tags=["alice-gate"])
+
+class AliceGateAdvanceRequest(BaseModel):
+    msg: str
+    ctx: List[Dict[str, Any]] = []
+    mode: str = "normal"
+    flags: Dict[str, Any] = {}
+
+class AliceGateAdvanceResponse(BaseModel):
+    decision: str
+    reasons: List[str]
+    question: Optional[str] = None
+
+
+# --- Semantic intent detection (backend-owned; no wake words) ---
+_ELONGATION_RE = re.compile(r"(.)\1{2,}")  # 3+ repeats -> 2
+_TRAIL_PUNCT_RE = re.compile(r"[.!?…]+$")
+
+def _normalize_human_token(msg: str) -> str:
+    s = (msg or "").lower().strip()
+    # Remove trailing punctuation runs (e.g., "hmmm..." -> "hmmm")
+    s = _TRAIL_PUNCT_RE.sub("", s)
+    # Collapse elongations (e.g., "hmmmmmm" -> "hhmm" shape -> effectively "hmm")
+    s = _ELONGATION_RE.sub(r"\1\1", s)
+    return s
+
+def classify_semantic_intent(msg: str, ctx: List[Dict[str, Any]]) -> str:
+    raw = (msg or "").strip()
+    s = _normalize_human_token(raw)
+
+    if not s:
+        return "ambient_noise"
+
+    # Thinking-aloud / non-invitation tokens (robust to elongation)
+    if re.fullmatch(r"(h+m+|u+m+|u+h+)", s):
+        return "thinking_aloud"
+    if re.fullmatch(r"[.]+", raw.strip()):
+        return "thinking_aloud"
+
+    # Simple ambient tests
+    if s in {"ping", "test"}:
+        return "ambient_test"
+
+    # Clear questions
+    if raw.endswith("?"):
+        return "question"
+
+    # Invitation / direct requests
+    if re.search(r"\b(can you|could you|help me|please|explain|how do i|what is)\b", s):
+        return "direct_request"
+
+    # Continuations
+    if re.search(r"\b(ok|so|right|then)\b", s):
+        return "continuation"
+
+    return "statement"
+
+
+@alice_gate_router.post("/advance", response_model=AliceGateAdvanceResponse)
+def alice_gate_advance(req: AliceGateAdvanceRequest) -> AliceGateAdvanceResponse:
+    # Backend-owned intent classification: no wake words, no name-prefix requirements.
+    flags = dict(req.flags or {})
+    if not flags.get("intent") and not flags.get("semantic_intent"):
+        flags["intent"] = classify_semantic_intent(req.msg, req.ctx)
+
+    decision, reasons, question = advance_gate(
+        msg=req.msg,
+        ctx=req.ctx,
+        mode=req.mode,
+        flags=flags,
+    )
+    # decision is an Enum; serialize to string
+    decision_str = decision.value if hasattr(decision, "value") else str(decision)
+    return AliceGateAdvanceResponse(decision=decision_str, reasons=reasons, question=question)
+
+from alice_gate import advance_gate, GateDecision
+from alice_gate import advance_gate, GateDecision
 from alice.memory_api import router as alice_memory_router
 from alice.name_resolution import resolve_alias_to_concept
 
@@ -70,7 +153,6 @@ from services.irr_ups import router as irr_router
 from services.irr_narrative import router as irr_narrative_router
 from services.finance_reader import summarize_finances, list_transactions, FinanceSnapshotError
 from services.task_ledger import create_task, add_step, add_artifact
-
 
 
 # ---------------------------------------------------------
@@ -1060,8 +1142,10 @@ def require_api_key(
     - Adds Alice/ISAC support:
         X-ISAC-READONLY-KEY == ISAC_READONLY_API_KEY
         X-ISAC-ADMIN-KEY   == ISAC_ADMIN_API_KEY or ISAC_ADMIN_KEY
-    - NEW (v4 contract fix):
-        X-ISAC-ADMIN-TOKEN is accepted if valid, so PIN-unlock can satisfy read gates.
+    NOTE (v6):
+    - X-ISAC-ADMIN-TOKEN is *not* accepted as a read gate.
+      Token proof is admin-only and handled by require_admin_if_configured.
+      This enforces the invariant that the UI must always send the base API key.
 
     If none of these are configured, access is open (no-op).
     """
@@ -1077,13 +1161,6 @@ def require_api_key(
     # If nothing is configured, do not gate.
     if not jarvis_key and not readonly_cfg and not admin_cfg and not configured_pin:
         return
-
-    # 0) If an admin token is presented and valid, accept it as read auth.
-    # This lets PIN-unlock power read-gated admin views (e.g. /tasks) without requiring API keys.
-    token = _clean(x_isac_admin_token)
-    if token and _is_valid_admin_token(token):
-        return
-
     # Accept any configured key presented via its corresponding header.
     if jarvis_key and _clean(x_api_key) == jarvis_key:
         return
@@ -1534,6 +1611,16 @@ def _parse_iso_to_dt(iso_str: Optional[str]) -> Optional[datetime]:
     """
     if not iso_str:
         return None
+
+
+# Back-compat helper: earlier UI/task creators call lineage_link_task().
+# v5 canonical implementation is lineage_init().
+def lineage_link_task(task_id: int, parent_task_id=None, trigger_reason=None) -> None:
+    try:
+        lineage_init(task_id=task_id, parent_task_id=parent_task_id, trigger_reason=trigger_reason)
+    except Exception:
+        # lineage is best-effort; never fail task creation because of lineage logging
+        return
     try:
         return datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
     except Exception:
@@ -2094,7 +2181,6 @@ async def ping() -> Dict[str, Any]:
     return {"status": "ok", "message": "ISAC brain is alive"}
 
 
-
 @health_router.get("/isac_internal")
 async def health_isac_internal(
     _admin_ok: None = Depends(require_admin_if_configured),
@@ -2577,8 +2663,6 @@ def _task_get_latest_artifact(task_id: int, artifact_type: str) -> Optional[Dict
         conn.close()
 
 
-
-
 def _is_path_allowed(path: str) -> bool:
     """Write allowlist (locked): /opt/jarvis/brain/** and /opt/jarvis/data/index.html"""
     if not path:
@@ -2589,7 +2673,6 @@ def _is_path_allowed(path: str) -> bool:
     if norm == "/opt/jarvis/data/index.html":
         return True
     return False
-
 
 
 def resolve_target_path(user_path: str, must_exist: bool = True) -> Optional[str]:
@@ -2818,7 +2901,6 @@ def _apply_unified_diff(original_text: str, diff_text: str) -> Dict[str, Any]:
     }
 
 
-
 def _task_next_step_index(task_id: int) -> int:
     conn = _task_db_connect()
     try:
@@ -2876,7 +2958,6 @@ def create_tooling_probe_task(
     return {"ok": True, "task_id": task_id}
 
 
-
 # ---------------------------------------------------------
 # Escape Hatch v3 — Templates: File Write (dry-run by default)
 # ---------------------------------------------------------
@@ -2893,7 +2974,6 @@ class DiffApplyTaskCreateRequest(BaseModel):
     path: str = Field(..., min_length=1)
     unified_diff_b64: str = Field(..., min_length=1, description="Base64-encoded unified diff text")
     dry_run: bool = True
-
 
 
 @app.post(
@@ -2943,10 +3023,11 @@ def create_file_write_task(body: FileWriteTaskCreateRequest) -> Dict[str, Any]:
             {
                 "path": body.path,
                 "dry_run": bool(body.dry_run),
-                "unified_diff_b64": body.unified_diff_b64,
+                "content_b64": body.content_b64,
                 "bytes": len(raw),
                 "sha256": sha256,
-                "content_b64": body.content_b64,
+                "trigger_reason": body.trigger_reason,
+                "parent_task_id": body.parent_task_id,
             }
         ),
     )
@@ -2958,8 +3039,6 @@ def create_file_write_task(body: FileWriteTaskCreateRequest) -> Dict[str, Any]:
     )
 
     return {"status": "ok", "task_id": task_id, "sha256": sha256, "bytes": len(raw), "dry_run": bool(body.dry_run)}
-
-
 
 
 @app.post(
@@ -5268,6 +5347,7 @@ app.include_router(runner_router)
 # Alice (Phase 8) — read-only preview endpoint
 app.include_router(alice_router)
 app.include_router(alice_memory_router)
+app.include_router(alice_gate_router)
 
 app.include_router(ha_router)
 app.include_router(calendar_router)
