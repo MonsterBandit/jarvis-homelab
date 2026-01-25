@@ -81,6 +81,8 @@ class AliceGateAdvanceResponse(BaseModel):
     decision: str
     reasons: List[str]
     question: Optional[str] = None
+    # Bundle 1 (B1): Context Integrity & Continuity (Alice-only)
+    integrity: Dict[str, Any] = {}
 
 
 # --- Semantic intent detection (backend-owned; no wake words) ---
@@ -126,25 +128,157 @@ def classify_semantic_intent(msg: str, ctx: List[Dict[str, Any]]) -> str:
 
     return "statement"
 
+    
+# ---------------------------------------------------------
+# Bundle 1 (B1) — Context Integrity & Continuity (Alice-only)
+# Pure logic: no I/O, no DB, no tools, no model calls.
+# ---------------------------------------------------------
 
+def _b1_stable_ctx_hash(ctx: Any) -> str:
+    """Best-effort stable hash for ctx (internal diagnostics only)."""
+    try:
+        payload = json.dumps(ctx, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    except Exception:
+        return "sha256:unavailable"
+
+
+def _b1_continuity_state(chat_id: str, ctx_len: int) -> tuple[str, List[str]]:
+    """Return (state, notes) where state is present|suspect|missing."""
+    notes: List[str] = []
+    chat_present = bool((chat_id or "").strip()) and (chat_id != "unknown")
+    if not chat_present:
+        notes.append("B1_CHAT_ID_MISSING")
+        if ctx_len <= 0:
+            notes.append("B1_CTX_EMPTY")
+        return ("missing", notes)
+
+    if ctx_len <= 0:
+        notes.append("B1_CTX_MISSING_FOR_CHAT")
+        return ("suspect", notes)
+
+    return ("present", notes)
+
+
+def _b1_notes_to_reason_tags(notes: List[str]) -> List[str]:
+    """Convert internal notes to the public reason tags we locked (Option B)."""
+    tags: List[str] = []
+    for n in notes:
+        if n == "B1_CHAT_ID_MISSING":
+            tags.append("B1_CONTINUITY:CHAT_ID_MISSING")
+        elif n == "B1_CTX_MISSING_FOR_CHAT":
+            tags.append("B1_CONTINUITY:CTX_EMPTY_FOR_CHAT")
+        elif n == "B1_CTX_EMPTY":
+            tags.append("B1_CONTINUITY:CTX_EMPTY")
+    return tags
+
+
+def _b1_integrity_payload(
+    *,
+    endpoint: str,
+    user_id: str,
+    chat_id: str,
+    ctx_len: int,
+    notes: List[str],
+    intent_value: str,
+    intent_source: str,
+) -> Dict[str, Any]:
+    return {
+        "cco_version": "B1.v1",
+        "endpoint": endpoint,
+        "continuity_state": ("present" if not notes else ("suspect" if "B1_CTX_MISSING_FOR_CHAT" in notes else "missing"
+                            if "B1_CHAT_ID_MISSING" in notes else "present")),
+        "notes": list(notes),
+        "intent": {"value": intent_value, "source": intent_source},
+        "identity": {
+            "user_id_present": bool((user_id or "").strip()) and (user_id != "unknown"),
+            "chat_id_present": bool((chat_id or "").strip()) and (chat_id != "unknown"),
+        },
+        "conversation": {"ctx_len": int(ctx_len)},
+    }
 @alice_gate_router.post("/advance", response_model=AliceGateAdvanceResponse)
-def alice_gate_advance(req: AliceGateAdvanceRequest) -> AliceGateAdvanceResponse:
-    # Backend-owned intent classification: no wake words, no name-prefix requirements.
-    flags = dict(req.flags or {})
-    if not flags.get("intent") and not flags.get("semantic_intent"):
-        flags["intent"] = classify_semantic_intent(req.msg, req.ctx)
+def alice_gate_advance(request: Request, req: AliceGateAdvanceRequest) -> AliceGateAdvanceResponse:
+    """
+    Alice Gate Advance — Bundle 1 wrapped.
+    - Preserves pure governance gate semantics
+    - Adds Context Integrity & Continuity signals (Alice-only)
+    """
+    endpoint = "/alice/gate/advance"
 
+    # Headers (identity + session continuity carriers)
+    user_id = (request.headers.get("X-ISAC-USER-ID") or "unknown").strip() or "unknown"
+    chat_id = (request.headers.get("X-ISAC-CHAT-ID") or "unknown").strip() or "unknown"
+
+    msg = req.msg
+    ctx = req.ctx or []
+    flags = dict(req.flags or {})
+
+    # --- Hard schema checks (fail closed, return RESTRAIN) ---
+    hard_notes: List[str] = []
+    if not isinstance(msg, str) or not msg.strip():
+        hard_notes.append("B1_EMPTY_MSG")
+    if not isinstance(ctx, list):
+        hard_notes.append("B1_CTX_BAD_SHAPE")
+    if not isinstance(flags, dict):
+        hard_notes.append("B1_FLAGS_BAD_SHAPE")
+
+    continuity_state, continuity_notes = _b1_continuity_state(chat_id, len(ctx) if isinstance(ctx, list) else 0)
+
+    # Intent normalization (preserve existing behavior)
+    intent_source = "provided"
+    intent_value = str(flags.get("intent") or flags.get("semantic_intent") or "").strip().lower()
+    if not intent_value:
+        intent_source = "derived"
+        try:
+            intent_value = classify_semantic_intent(msg if isinstance(msg, str) else "", ctx if isinstance(ctx, list) else [])
+        except Exception:
+            intent_value = "unknown"
+        flags["intent"] = intent_value
+
+    # Build integrity payload (minimal, public)
+    notes = list(hard_notes) + list(continuity_notes)
+    integrity = _b1_integrity_payload(
+        endpoint=endpoint,
+        user_id=user_id,
+        chat_id=chat_id,
+        ctx_len=(len(ctx) if isinstance(ctx, list) else 0),
+        notes=notes,
+        intent_value=intent_value or "unknown",
+        intent_source=intent_source,
+    )
+
+    # If schema failed, RESTRAIN immediately (A0)
+    if hard_notes:
+        reasons = list(hard_notes) + _b1_notes_to_reason_tags(continuity_notes)
+        return AliceGateAdvanceResponse(
+            decision="RESTRAIN",
+            reasons=reasons,
+            question=None,
+            integrity=integrity,
+        )
+
+    # --- Governance gate call (unchanged) ---
     decision, reasons, question = advance_gate(
-        msg=req.msg,
-        ctx=req.ctx,
+        msg=msg,
+        ctx=ctx,
         mode=req.mode,
         flags=flags,
     )
+
     # decision is an Enum; serialize to string
     decision_str = decision.value if hasattr(decision, "value") else str(decision)
-    return AliceGateAdvanceResponse(decision=decision_str, reasons=reasons, question=question)
 
-from alice_gate import advance_gate, GateDecision
+    # Option B (locked): duplicate integrity notes into reasons as B1_CONTINUITY:* tags
+    reasons_out = list(reasons or []) + _b1_notes_to_reason_tags(continuity_notes)
+
+    return AliceGateAdvanceResponse(
+        decision=decision_str,
+        reasons=reasons_out,
+        question=question,
+        integrity=integrity,
+    )
+
+
 from alice_gate import advance_gate, GateDecision
 from alice.memory_api import router as alice_memory_router
 from alice.name_resolution import resolve_alias_to_concept
@@ -5575,6 +5709,47 @@ async def sqlite_integrity_error_handler(
     )
 
 
+
+# ---------------------------------------------------------
+# Bundle 1 (B1) — Alice identity completeness dependency
+# Enforced only on /alice/* prefixed routers (Alice-only scope).
+# Pure logic: no DB reads/writes, no tools.
+# ---------------------------------------------------------
+
+def require_user_identity_for_alice(request: Request) -> None:
+    user_id = (request.headers.get("X-ISAC-USER-ID") or "").replace("\r", "").strip()
+    chat_id = (request.headers.get("X-ISAC-CHAT-ID") or "").replace("\r", "").strip()
+
+    user_present = bool(user_id)
+    chat_present = bool(chat_id)
+
+    notes: List[str] = []
+    if not user_present:
+        notes.append("B1_USER_ID_MISSING")
+    if not chat_present:
+        notes.append("B1_CHAT_ID_MISSING")
+
+    if user_present:
+        return
+
+    # Unified B1 Integrity Error Format (minimal)
+    detail = {
+        "error": {
+            "code": "B1_USER_ID_MISSING",
+            "message": "User identity is required for this endpoint.",
+            "hint": "Send X-ISAC-USER-ID header.",
+        },
+        "integrity": {
+            "cco_version": "B1.v1",
+            "endpoint": request.url.path,
+            "continuity_state": ("present" if chat_present else "missing"),
+            "notes": notes,
+            "identity": {"user_id_present": False, "chat_id_present": chat_present},
+        },
+    }
+    raise HTTPException(status_code=400, detail=detail)
+
+
 # ----------------------------
 # Mount routers
 # ----------------------------
@@ -5614,23 +5789,23 @@ app.include_router(
 )
 
 # Identity & Memory v1 — /alice aliases (for front-door routing)
-app.include_router(identity_v1_router, prefix="/alice", dependencies=[Depends(require_api_key)])
-app.include_router(memory_v1_router, prefix="/alice", dependencies=[Depends(require_api_key)])
+app.include_router(identity_v1_router, prefix="/alice", dependencies=[Depends(require_api_key), Depends(require_user_identity_for_alice)])
+app.include_router(memory_v1_router, prefix="/alice", dependencies=[Depends(require_api_key), Depends(require_user_identity_for_alice)])
 
 app.include_router(
     identity_v1_admin_router,
     prefix="/alice",
-    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+    dependencies=[Depends(require_api_key), Depends(require_user_identity_for_alice), Depends(require_admin_if_configured)],
 )
 app.include_router(
     memory_v1_admin_router,
     prefix="/alice",
-    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+    dependencies=[Depends(require_api_key), Depends(require_user_identity_for_alice), Depends(require_admin_if_configured)],
 )
 app.include_router(
     admin_inbox_v1_router,
     prefix="/alice",
-    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+    dependencies=[Depends(require_api_key), Depends(require_user_identity_for_alice), Depends(require_admin_if_configured)],
 )
 
 app.include_router(ha_router)
