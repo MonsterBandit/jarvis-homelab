@@ -1,0 +1,13 @@
+{
+  "domain": "backbone/docker_compose",
+  "authoritative_only": true,
+  "sources": [
+    {
+      "name": "Docker Compose Docs",
+      "type": "web",
+      "url": "https://docs.docker.com/compose/",
+      "signals": ["reference_docs"]
+    }
+  ],
+  "exclusions": ["forums", "blogs", "reddit", "unofficial_guides"]
+}

@@ -1,0 +1,13 @@
+{
+  "domain": "stacks/tools/watchtower",
+  "authoritative_only": true,
+  "sources": [
+    {
+      "name": "Watchtower GitHub Repository",
+      "type": "github",
+      "repo": "containrrr/watchtower",
+      "signals": ["releases", "tags", "security_advisories", "security_policy"]
+    }
+  ],
+  "exclusions": ["forums", "blogs", "reddit", "unofficial_guides"]
+}

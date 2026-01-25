@@ -40,17 +40,24 @@ def _fail(req: ToolRequest, cls: ToolFailureClass, msg: str, started_at: str, t0
 
 
 def _is_path_allowed(path: str) -> bool:
-    """Read allowlist (LOCKED to match write allowlist):
+    """Read allowlist (LOCKED to match write allowlist + OKD):
     - /opt/jarvis/brain/**
     - /opt/jarvis/data/index.html
+    - /opt/jarvis/governance/operational_knowledge/**
     """
     if not path:
         return False
     norm = os.path.abspath(path)
+
     if norm.startswith("/opt/jarvis/brain/"):
         return True
+
     if norm == "/opt/jarvis/data/index.html":
         return True
+
+    if norm.startswith("/opt/jarvis/governance/operational_knowledge/"):
+        return True
+
     return False
 
 

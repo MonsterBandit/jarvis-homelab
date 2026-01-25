@@ -316,6 +316,9 @@ def _failure_class_from_exception(exc: Exception) -> str:
 # ----------------------------
 
 DB_PATH = os.getenv("JARVIS_DB_PATH", "/app/data/jarvis_brain.db")
+
+# Identity & Memory v1: expose DB path to submodules
+# (read-only reference; actual schema is migrated via SQL)
 ENABLE_DIFF_APPLY = os.getenv("ENABLE_DIFF_APPLY", "0").strip() in ("1","true","TRUE","yes","YES")
 
 
@@ -1116,6 +1119,9 @@ app = FastAPI(
     title="ISAC Brain",
     version="1.0.0",
 )
+
+# Identity & Memory v1: shared DB path for routers
+app.state.db_path = DB_PATH
 
 # Allow CORS from anywhere for now. Adjust in production if needed.
 app.add_middleware(
@@ -5573,12 +5579,59 @@ async def sqlite_integrity_error_handler(
 # Mount routers
 # ----------------------------
 
+# Identity & Memory v1 routers (post-auth definitions; avoids circular imports)
+from identity_memory.router import (
+    identity_router as identity_v1_router,
+    memory_router as memory_v1_router,
+    admin_identity_router as identity_v1_admin_router,
+    admin_memory_router as memory_v1_admin_router,
+    admin_inbox_router as admin_inbox_v1_router,
+)
+
+
 app.include_router(health_router)
 app.include_router(runner_router)
 # Alice (Phase 8) — read-only preview endpoint
 app.include_router(alice_router)
 app.include_router(alice_memory_router)
 app.include_router(alice_gate_router)
+
+# Identity & Memory v1 (auto-provision + explicit consent)
+app.include_router(identity_v1_router, dependencies=[Depends(require_api_key)])
+app.include_router(memory_v1_router, dependencies=[Depends(require_api_key)])
+
+app.include_router(
+    identity_v1_admin_router,
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+app.include_router(
+    memory_v1_admin_router,
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+app.include_router(
+    admin_inbox_v1_router,
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+
+# Identity & Memory v1 — /alice aliases (for front-door routing)
+app.include_router(identity_v1_router, prefix="/alice", dependencies=[Depends(require_api_key)])
+app.include_router(memory_v1_router, prefix="/alice", dependencies=[Depends(require_api_key)])
+
+app.include_router(
+    identity_v1_admin_router,
+    prefix="/alice",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+app.include_router(
+    memory_v1_admin_router,
+    prefix="/alice",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+app.include_router(
+    admin_inbox_v1_router,
+    prefix="/alice",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
 
 app.include_router(ha_router)
 app.include_router(calendar_router)

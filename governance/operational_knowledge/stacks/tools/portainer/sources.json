@@ -1,0 +1,13 @@
+{
+  "domain": "stacks/tools/portainer",
+  "authoritative_only": true,
+  "sources": [
+    {
+      "name": "Portainer GitHub Repository",
+      "type": "github",
+      "repo": "portainer/portainer",
+      "signals": ["releases", "tags", "security_advisories"]
+    }
+  ],
+  "exclusions": ["forums", "blogs", "reddit", "unofficial_guides"]
+}

@@ -1,0 +1,13 @@
+{
+  "domain": "stacks/tools/nginx_proxy_manager",
+  "authoritative_only": true,
+  "sources": [
+    {
+      "name": "Nginx Proxy Manager GitHub Repository",
+      "type": "github",
+      "repo": "NginxProxyManager/nginx-proxy-manager",
+      "signals": ["releases", "tags", "security_advisories"]
+    }
+  ],
+  "exclusions": ["forums", "blogs", "reddit", "unofficial_guides"]
+}

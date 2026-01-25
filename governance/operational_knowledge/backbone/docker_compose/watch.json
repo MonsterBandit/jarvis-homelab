@@ -1,0 +1,16 @@
+{
+  "watch_enabled": false,
+  "schedule": {
+    "rrule": "FREQ=WEEKLY;BYDAY=SU;BYHOUR=4;BYMINUTE=0;BYSECOND=0",
+    "timezone": "local"
+  },
+  "hotfix_exception": {
+    "enabled": true,
+    "criteria": "security_critical_only"
+  },
+  "behavior": {
+    "auto_ingest": false,
+    "generate_update_brief": true,
+    "requires_admin_approval": true
+  }
+}

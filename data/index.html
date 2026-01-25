@@ -742,6 +742,14 @@
 
     toolsCall: '/tools/call',
 
+    // Identity & Memory v1
+    idMe: '/alice/identity/users/me',
+    idResolve: '/alice/identity/users/resolve',
+    memShow: '/alice/memory/show',
+    memWrite: '/alice/memory/write',
+    memForget: '/alice/memory/forget',
+    adminInbox: '/alice/admin/inbox',
+
     memoryCandidates: {
       concepts: [
         '/alice/memory/concepts',
@@ -762,7 +770,7 @@
     tasksOpen: false,
     tasks: [],
 
-    pendingMemory: null,     // { kind:'write'|'delete', key:'...' }
+    pendingMemory: null,     // { kind:'write'|'delete'|'memv1_write'|'memv1_forget', key:'...', value?:'...' }
 
     memoryEndpoints: { conceptsBase: null },
 
@@ -1531,7 +1539,11 @@
   function buildHeaders(extra) {
     if (!state.apiKey) throw new Error('Base API key missing');
 
-    const h = { 'Content-Type': 'application/json', 'X-API-Key': state.apiKey };
+    const h = {
+      'Content-Type': 'application/json',
+      'X-API-Key': state.apiKey,
+      'X-ISAC-USER-ID': getUserId(), // REQUIRED for Identity & Memory
+    };
 
     if (state.adminUnlocked) {
       h['X-ISAC-ADMIN-KEY'] = state.apiKey;
@@ -1771,6 +1783,79 @@
     return String(s || '').trim().replace(/^["“”']|["“”']$/g, '').trim();
   }
 
+
+  // ---------- Command normalization & pattern routing (Natural-language pressure relief) ----------
+  // Deterministic, bounded: strips harmless filler so capability commands don't fall through to /advance.
+  function normalizeCommandText(raw) {
+    let s = String(raw || '').trim().toLowerCase();
+
+  // Remove trailing sentence punctuation.
+    s = s.replace(/[?!.…]+$/g, '').trim();
+
+  // Collapse whitespace.
+    s = s.replace(/\s+/g, ' ').trim();
+
+  // Strip common polite lead-ins (only at the start).
+    s = s.replace(/^(please|pls)\s+/, '');
+    s = s.replace(/^(can you|could you|would you|will you)\s+/, '');
+    s = s.replace(/^(hey|hi|hello)\s+/, '');
+
+  // Strip light filler phrases at the start.
+    s = s.replace(/^(ok|okay|alright)\s*[,:]?\s+/, '');
+
+  // Re-collapse after removals.
+    s = s.replace(/\s+/g, ' ').trim();
+    return s;
+  }
+
+  function parseMemoryCommand(rawText) {
+    const s = normalizeCommandText(rawText);
+
+  // SHOW MEMORY (variants)
+    if (/^show\s+(?:me\s+)?(?:my\s+)?memory$/.test(s)) return { kind: 'mem_show' };
+    if (/^show\s+(?:me\s+)?memories$/.test(s)) return { kind: 'mem_show' };
+    if (/^show\s+(?:me\s+)?my\s+memories$/.test(s)) return { kind: 'mem_show' };
+    if (/^my\s+memories$/.test(s)) return { kind: 'mem_show' };
+    if (/^what\s+do\s+you\s+remember(?:\s+about\s+me)?$/.test(s)) return { kind: 'mem_show' };
+    if (/^tell\s+me\s+what\s+you\s+remember(?:\s+about\s+me)?$/.test(s)) return { kind: 'mem_show' };
+
+  // WHO AM I (identity)
+    if (/^who\s+am\s+i$/.test(s)) return { kind: 'whoami' };
+
+  // FORGET
+    // "forget key", "forget that key", "forget my favorite color"
+    const f1 = s.match(/^forget\s+(?:that\s+)?(.+)$/);
+    if (f1) {
+      const key = normalizeConceptKey(f1[1]);
+      if (key) return { kind: 'mem_forget', key };
+      return { kind: 'ambiguous_forget' };
+    }
+
+  // REMEMBER (writes)
+    // Preferred: key=value
+    const rEq = s.match(/^remember\s+(.+?)\s*=\s*(.+)$/);
+    if (rEq) {
+      const key = normalizeConceptKey(rEq[1]);
+      const val = String(rEq[2] || '').trim();
+      if (key && val) return { kind: 'mem_write', key, val };
+      return { kind: 'ambiguous_remember' };
+    }
+
+  // Natural: "remember (that )?<key> is <value>"
+    const rIs = s.match(/^remember\s+(?:that\s+)?(.+?)\s+is\s+(.+)$/);
+    if (rIs) {
+      const key = normalizeConceptKey(rIs[1]);
+      const val = String(rIs[2] || '').trim();
+      if (key && val) return { kind: 'mem_write', key, val };
+      return { kind: 'ambiguous_remember' };
+    }
+
+  // If it starts with "remember" but didn't match a safe pattern, treat as ambiguous command (clarify).
+    if (/^remember\b/.test(s)) return { kind: 'ambiguous_remember' };
+
+  return null;
+  }
+
   function makeConceptPayload(conceptKey) {
     return { concept_key: conceptKey, notes: 'memory test concept', confidence: 1.0 };
   }
@@ -1821,7 +1906,35 @@
     return await fetchJson(url, { method: 'DELETE' });
   }
 
-  function isAffirmation(text) {
+  
+// ---------- Identity & Memory v1 (Tier 1: safe self-profile) ----------
+async function idMe() {
+  const data = await fetchJson(API.idMe, { method:'GET' });
+  return data;
+}
+
+async function memV1Show() {
+  const data = await fetchJson(API.memShow, { method:'GET' });
+  return data;
+}
+
+async function memV1Write(key, value) {
+  const body = { memory_key: String(key || '').trim(), memory_value: String(value || '').trim() };
+  if (!body.memory_key || !body.memory_value) throw new Error('memory_key and memory_value required');
+  return await fetchJson(API.memWrite, { method:'POST', body: JSON.stringify(body) });
+}
+
+async function memV1Forget(key) {
+  const body = { memory_key: String(key || '').trim() };
+  if (!body.memory_key) throw new Error('memory_key required');
+  return await fetchJson(API.memForget, { method:'POST', body: JSON.stringify(body) });
+}
+
+async function adminInboxList() {
+  return await fetchJson(API.adminInbox, { method:'GET' });
+}
+
+function isAffirmation(text) {
     const t = String(text || '').trim().toLowerCase();
     return ['yes','y','yep','yeah','ok','okay','confirm','do it','sure','affirmative','proceed'].includes(t);
   }
@@ -1830,9 +1943,36 @@
     return ['no','n','nope','nah','cancel','stop','never mind','nevermind','forget it','dont','don’t'].includes(t);
   }
 
-  function setPending(kind, key) {
+  function setPending(kind, key, value) {
     state.pendingMemory = { kind, key: normalizeConceptKey(key) };
-    if (state.pendingMemory.key) toast(`Pending ${kind}: ${state.pendingMemory.key} (reply “yes” to confirm)`);
+    if (value != null) state.pendingMemory.value = String(value);
+
+    const k = state.pendingMemory.key;
+    const v = (state.pendingMemory.value != null) ? String(state.pendingMemory.value) : '';
+    if (!k) return;
+
+    // Conversation-first: confirmation must appear in-chat, not as a toast.
+    if (kind === 'memv1_write') {
+      sayAlice(`I can remember that as: ${k} = ${v}.
+
+Reply “yes” to confirm, or “no” to cancel.`);
+    } else if (kind === 'memv1_forget') {
+      sayAlice(`I can forget: ${k}.
+
+Reply “yes” to confirm, or “no” to cancel.`);
+    } else if (kind === 'write') {
+      sayAlice(`I can save: ${k}.
+
+Reply “yes” to confirm, or “no” to cancel.`);
+    } else if (kind === 'delete') {
+      sayAlice(`I can remove: ${k}.
+
+Reply “yes” to confirm, or “no” to cancel.`);
+    } else {
+      sayAlice(`Pending action: ${k}.
+
+Reply “yes” to confirm, or “no” to cancel.`);
+    }
   }
   function clearPending() { state.pendingMemory = null; }
 
@@ -1840,31 +1980,39 @@
     if (!state.pendingMemory) return false;
 
     if (isNegation(userText)) {
-      toast('Cancelled.');
+      sayAlice('Okay. Cancelled.');
       clearPending();
       return true;
     }
 
     if (!isAffirmation(userText)) {
-      toast('Pending confirmation. Reply “yes” to confirm or “no” to cancel.');
+      sayAlice('Reply “yes” to confirm, or “no” to cancel.');
       return true;
     }
 
-    const { kind, key } = state.pendingMemory;
+    const { kind, key, value } = state.pendingMemory;
     clearPending();
 
     try {
       if (kind === 'write') {
         await memoryWriteConcept(key);
-        toast('Memory write complete.');
+        sayAlice('Saved.');
       } else if (kind === 'delete') {
         await memoryDeleteConcept(key);
-        toast('Memory delete complete.');
+        sayAlice('Removed.');
+      } else if (kind === 'memv1_write') {
+        const val = String(value || '').trim();
+        await memV1Write(key, val);
+        sayAlice('Saved to your profile.');
+      } else if (kind === 'memv1_forget') {
+        await memV1Forget(key);
+        sayAlice('Forgotten.');
       } else {
+
         throw new Error('Unknown pending action');
       }
     } catch (e) {
-      toast(`Memory action failed (${e.status || 'ERR'}).`);
+      sayAlice(`That didn’t work (${e.status || 'ERR'}).`);
     }
 
     return true;
@@ -1972,14 +2120,135 @@
   // ---------- Command routing ----------
   async function handle(text) {
     const t = String(text || '').trim();
-    const c = t.toLowerCase();
-
+    const c = normalizeCommandText(t);
     if (state.pendingMemory) {
       const consumed = await handlePendingConfirmation(t);
       if (consumed) return;
     }
 
     if (c === 'show tasks' || c === 'tasks') { openTasks(); return; }
+
+    if (c === 'who am i' || c === 'whoami' || c === 'me') {
+      try {
+        const data = await idMe();
+        systemCard('RESULT · Identity', `<pre>${esc(JSON.stringify(data, null, 2))}</pre>`);
+      } catch (e) {
+        sayAlice(`I couldn’t read your identity (${e.status || 'ERR'}).`);
+      }
+      return;
+    }
+
+    if (c === 'show my memory' || c === 'show me my memory' || c === 'show memory' || c === 'show me memory' || c === 'memories') {
+      try {
+        const data = await memV1Show();
+        systemCard('RESULT · Memory (v1)', `<pre>${esc(JSON.stringify(data, null, 2))}</pre>`);
+      } catch (e) {
+        sayAlice(`I couldn’t read your memory (${e.status || 'ERR'}).`);
+      }
+      return;
+    }
+
+    if (c === 'show inbox' || c === 'admin inbox') {
+      if (!state.adminUnlocked) { toast('Admin locked. Type: unlock admin'); return; }
+      try {
+        const data = await adminInboxList();
+        systemCard('RESULT · Admin inbox', `<pre>${esc(JSON.stringify(data, null, 2))}</pre>`);
+      } catch (e) {
+        toast(`Inbox read failed (${e.status || 'ERR'}).`);
+      }
+      return;
+    }
+
+    
+    // Capability command routing (memory + identity) BEFORE /advance gating.
+    // This prevents natural phrasing from being misclassified as ambient statements.
+    const memCmd = parseMemoryCommand(t);
+    if (memCmd) {
+      if (memCmd.kind === 'mem_show') {
+        try {
+          const data = await memV1Show();
+          systemCard('RESULT · Memory (v1)', `<pre>${esc(JSON.stringify(data, null, 2))}</pre>`);
+        } catch (e) {
+          sayAlice(`I couldn’t read your memory (${e.status || 'ERR'}).`);
+        }
+        return;
+      }
+      if (memCmd.kind === 'whoami') {
+        try {
+          const data = await identityWhoAmI();
+          systemCard('RESULT · Identity (v1)', `<pre>${esc(JSON.stringify(data, null, 2))}</pre>`);
+        } catch (e) {
+          sayAlice(`I couldn’t read your identity (${e.status || 'ERR'}).`);
+        }
+        return;
+      }
+      if (memCmd.kind === 'mem_write') {
+        setPending('memv1_write', memCmd.key, memCmd.val);
+        return;
+      }
+      if (memCmd.kind === 'mem_forget') {
+        setPending('memv1_forget', memCmd.key);
+        return;
+      }
+      if (memCmd.kind === 'ambiguous_remember') {
+        sayAlice('What should I remember, exactly? Use `remember key=value` or `remember <key> is <value>`.');
+        return;
+      }
+      if (memCmd.kind === 'ambiguous_forget') {
+        sayAlice('What should I forget? For example: `forget favorite color`.');
+        return;
+      }
+    }
+
+// v1 profile memory command: "remember key=value"
+    const rem = t.match(/^remember\s+([^=:\n]+)\s*[:=]\s*(.+)$/i);
+    if (rem) {
+      const key = normalizeConceptKey(rem[1]);
+      const val = String(rem[2] || '').trim();
+      if (!key || !val) { sayAlice('Use `remember key=value` (or `remember <key> is <value>`).'); return; }
+      setPending('memv1_write', key, val);
+      toast('Pending save. Reply “yes” to confirm.');
+      return;
+    }
+
+    // v1 profile memory command: natural language "remember KEY is VALUE"
+    // Examples:
+    //   remember my favorite color is blue
+    //   remember that my favorite color is blue
+    const rem2 = t.match(/^remember\s+(?:that\s+)?(.+?)\s+is\s+(.+)$/i);
+    if (rem2) {
+      const key = normalizeConceptKey(rem2[1]);
+      const val = String(rem2[2] || '').trim();
+      if (!key || !val) { sayAlice('Use `remember key=value` (or `remember <key> is <value>`).'); return; }
+      setPending('memv1_write', key, val);
+      toast('Pending save. Reply “yes” to confirm.');
+      return;
+    }
+
+    // v1 profile memory command: minimal fallback "remember KEY VALUE"
+    // (Only if KEY is multi-word to avoid accidental captures.)
+    const rem3 = t.match(/^remember\s+(.+?)\s+([^\s]+)$/i);
+    if (rem3) {
+      const keyRaw = String(rem3[1] || '').trim();
+      const val = String(rem3[2] || '').trim();
+      if (keyRaw && keyRaw.includes(' ') && val) {
+        const key = normalizeConceptKey(keyRaw);
+        setPending('memv1_write', key, val);
+        toast('Pending save. Reply “yes” to confirm.');
+        return;
+      }
+    }
+
+    // v1 profile forget: "forget key"
+    const fkv1 = t.match(/^forget\s+(.+)$/i);
+    if (fkv1) {
+      const key = normalizeConceptKey(fkv1[1]);
+      if (!key) { toast('Forget what? Provide a key.'); return; }
+      setPending('memv1_forget', key);
+      toast('Pending forget. Reply “yes” to confirm.');
+      return;
+    }
+
     if (c === 'unlock admin' || c === 'unlock') { showUnlockCard(); return; }
     if (c === 'lock admin' || c === 'lock') { lockAdmin(); return; }
     if (/^start over\b/i.test(t) || c === 'reset chat') {
@@ -1996,7 +2265,7 @@
         if (!items.length) systemNote('Memory is currently empty.');
         else systemCard('RESULT · Memories', `<pre>${esc(JSON.stringify(items, null, 2))}</pre>`);
       } catch (e) {
-        toast(`Memory read failed (${e.status || 'ERR'}).`);
+        sayAlice(`I couldn’t read your memory (${e.status || 'ERR'}).`);
       }
       return;
     }

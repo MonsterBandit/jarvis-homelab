@@ -1,0 +1,20 @@
+{
+  "domain": "stacks/finance/myfin",
+  "authoritative_only": true,
+  "sources": [
+    {
+      "name": "MyFin Web",
+      "type": "web",
+      "url": "TBD",
+      "signals": ["docs_updates"]
+    },
+    {
+      "name": "MyFin API/Repositories",
+      "type": "repo",
+      "url": "TBD",
+      "signals": ["releases", "tags", "security_advisories"]
+    }
+  ],
+  "notes": "MyFin sources are placeholders pending explicit curation of authoritative repos/URLs.",
+  "exclusions": ["forums", "blogs", "reddit", "unofficial_guides"]
+}
