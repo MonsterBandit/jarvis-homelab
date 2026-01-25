@@ -1,5 +1,5 @@
 {
-  "watch_enabled": false,
+  "schema_version": "okd.v1",
   "schedule": {
     "rrule": "FREQ=WEEKLY;BYDAY=SU;BYHOUR=4;BYMINUTE=0;BYSECOND=0",
     "timezone": "local"
@@ -12,5 +12,10 @@
     "auto_ingest": false,
     "generate_update_brief": true,
     "requires_admin_approval": true
-  }
+  },
+  "outputs": {
+    "digest_mode": "single_combined_digest",
+    "artifact": "update_brief"
+  },
+  "watch_enabled": false
 }

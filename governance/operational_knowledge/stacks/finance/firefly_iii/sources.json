@@ -1,4 +1,5 @@
 {
+  "schema_version": "okd.v1",
   "domain": "stacks/finance/firefly_iii",
   "authoritative_only": true,
   "sources": [
@@ -6,20 +7,34 @@
       "name": "Firefly III Official Site",
       "type": "web",
       "url": "https://www.firefly-iii.org",
-      "signals": ["docs_updates"]
+      "signals": [
+        "docs_updates"
+      ]
     },
     {
       "name": "Firefly III Documentation",
       "type": "web",
       "url": "https://docs.firefly-iii.org",
-      "signals": ["docs_updates"]
+      "signals": [
+        "docs_updates"
+      ]
     },
     {
       "name": "Firefly III GitHub Repository",
       "type": "github",
       "repo": "firefly-iii/firefly-iii",
-      "signals": ["releases", "tags", "security_advisories"]
+      "signals": [
+        "releases",
+        "tags",
+        "security_advisories"
+      ]
     }
   ],
-  "exclusions": ["forums", "blogs", "reddit", "unofficial_guides"]
+  "exclusions": [
+    "forums",
+    "blogs",
+    "reddit",
+    "unofficial_guides"
+  ],
+  "notes": ""
 }

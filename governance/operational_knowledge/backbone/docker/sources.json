@@ -1,4 +1,5 @@
 {
+  "schema_version": "okd.v1",
   "domain": "backbone/docker",
   "authoritative_only": true,
   "sources": [
@@ -6,8 +7,16 @@
       "name": "Docker Docs",
       "type": "web",
       "url": "https://docs.docker.com",
-      "signals": ["reference_docs"]
+      "signals": [
+        "reference_docs"
+      ]
     }
   ],
-  "exclusions": ["forums", "blogs", "reddit", "unofficial_guides"]
+  "exclusions": [
+    "forums",
+    "blogs",
+    "reddit",
+    "unofficial_guides"
+  ],
+  "notes": ""
 }

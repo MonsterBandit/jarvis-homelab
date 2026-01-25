@@ -1,4 +1,5 @@
 {
+  "schema_version": "okd.v1",
   "domain": "backbone/dockstarter",
   "authoritative_only": true,
   "sources": [
@@ -6,14 +7,26 @@
       "name": "DockSTARTer Official Site",
       "type": "web",
       "url": "https://dockstarter.com",
-      "signals": ["docs_updates"]
+      "signals": [
+        "docs_updates"
+      ]
     },
     {
       "name": "DockSTARTer GitHub Repository",
       "type": "github",
       "repo": "GhostWriters/DockSTARTer",
-      "signals": ["releases", "tags", "security_advisories"]
+      "signals": [
+        "releases",
+        "tags",
+        "security_advisories"
+      ]
     }
   ],
-  "exclusions": ["forums", "blogs", "reddit", "unofficial_guides"]
+  "exclusions": [
+    "forums",
+    "blogs",
+    "reddit",
+    "unofficial_guides"
+  ],
+  "notes": ""
 }
