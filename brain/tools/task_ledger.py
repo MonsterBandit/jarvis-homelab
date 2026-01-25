@@ -1,4 +1,5 @@
 import sqlite3
+import json
 from typing import Optional, Dict, Any
 
 DB_PATH = "/app/data/jarvis_brain.db"
@@ -53,3 +54,16 @@ def add_artifact(
             (task_id, step_id, artifact_type, path, metadata_json),
         )
         return int(cur.lastrowid)
+
+
+# --- v4-1: tool_call helper (non-admin, read-only) ---
+
+def create_tool_call_task(tool_name: str, args: Dict[str, Any], purpose: str) -> int:
+    """Create a tool_call task and store its request as an artifact."""
+    task_id = create_task(title="tool_call", resume_hint=f"{tool_name}: {purpose}")
+    add_artifact(
+        task_id=task_id,
+        artifact_type="tool_request",
+        metadata_json=json.dumps({"tool_name": tool_name, "args": args, "purpose": purpose}),
+    )
+    return task_id

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>Alice — v6</title>
+  <title>Alice — v6 (v3 Presence Grammar)</title>
 
   <!--
     CANONICAL AUTH CONTRACT (DO NOT BREAK)
@@ -49,6 +49,7 @@
       --font:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
       --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;
       --max:1180px;
+      --contentMax: 720px;
     }
 
     *{box-sizing:border-box}
@@ -63,6 +64,9 @@
         radial-gradient(900px 700px at 18% 20%, rgba(253,224,71,.05), transparent 62%),
         linear-gradient(180deg, var(--bg), var(--bg2));
       overflow:hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
     }
 
     button,input,textarea{font-family:inherit}
@@ -183,7 +187,7 @@
     .scroll{
       flex:1;
       overflow:auto;
-      padding:14px;
+      padding:18px 16px;
       scroll-behavior:smooth;
     }
     .scroll::-webkit-scrollbar{width:10px}
@@ -196,17 +200,10 @@
       margin:10px 0;
       align-items:flex-start;
     }
-    .avatar{
-      flex:0 0 auto;
-      width:28px;height:28px;border-radius:12px;
-      display:grid;place-items:center;
-      border:1px solid rgba(255,255,255,.14);
-      background:rgba(255,255,255,.06);
-      color:rgba(255,255,255,.82);
-      user-select:none;
-    }
+    /* Avatars removed (v3 refinement) */
+    /* User bubbles remain. */
     .bubble{
-      max-width:min(760px, 100%);
+      max-width:min(var(--contentMax), 100%);
       border:1px solid rgba(255,255,255,.12);
       border-radius:18px;
       padding:10px 12px;
@@ -215,17 +212,12 @@
       box-shadow:0 8px 26px rgba(0,0,0,.25);
       line-height:1.35;
       overflow-wrap:anywhere;
+      font-size:15px;
     }
     .msg.me{justify-content:flex-end}
     .msg.me .bubble{
       background:rgba(56,189,248,.10);
       border-color:rgba(56,189,248,.22);
-    }
-    .msg.me .avatar{display:none}
-    .meta{
-      margin-top:6px;
-      font-size:11px;
-      color:var(--dim);
     }
     .bubble pre{
       margin:10px 0 0;
@@ -239,6 +231,45 @@
       max-width:100%;
     }
     .bubble code{font-family:var(--mono);font-size:12px}
+
+    /* Alice presence grammar: free-flow prose (no bubble). */
+    .aliceProse{
+      max-width:min(var(--contentMax), 100%);
+      line-height:1.62;
+      font-size:16px;
+      color:rgba(255,255,255,.90);
+      padding:2px 0;
+      overflow-wrap:anywhere;
+      letter-spacing: .005em;
+    }
+    .aliceProse p{margin:0 0 14px 0}
+    .aliceProse p:last-child{margin-bottom:0}
+    .aliceProse h3{
+      margin:2px 0 10px 0;
+      font-size:18px;
+      letter-spacing:.01em;
+      font-weight:700;
+    }
+    .aliceProse h4{
+      margin:2px 0 10px 0;
+      font-size:15px;
+      letter-spacing:.01em;
+      font-weight:700;
+      color:rgba(255,255,255,.86);
+      text-transform:none;
+    }
+    .aliceProse ul{
+      margin:0 0 12px 18px;
+      padding:0;
+    }
+    .aliceProse li{margin:6px 0}
+    /* System messages (no avatars) */
+    .msg.system{justify-content:flex-start}
+    .msg.system .bubble{
+      background:rgba(255,255,255,.04);
+      border-color:rgba(255,255,255,.10);
+      color:rgba(255,255,255,.80);
+    }
 
     .card{
       margin-top:10px;
@@ -405,7 +436,7 @@
     .empty{
       border:1px dashed rgba(255,255,255,.18);
       border-radius:16px;
-      padding:14px;
+      padding:18px 16px;
       color:var(--muted);
       background:rgba(0,0,0,.12);
       font-size:12px;
@@ -488,25 +519,103 @@
       padding:10px 12px;
     }
 
+    /* Restraint body language: quiet the frame slightly when Alice chooses RESTRAIN */
+    .restrained .topbar{opacity:.92}
+    .restrained .composer{opacity:.92}
+    .restrained .main{border-color:rgba(255,255,255,.10)}
+    .presenceGlyph{opacity:.88}
+
     :focus-visible{
       outline:2px solid rgba(56,189,248,.55);
       outline-offset:2px;
       border-radius:12px;
     }
 
-    /* System (non-conversational) messages: never Alice voice */
-    .msg.system{justify-content:flex-start}
-    .msg.system .avatar{
-      background:rgba(255,255,255,.04);
-      border-color:rgba(255,255,255,.10);
-      color:rgba(255,255,255,.55);
+    /* v3 Presence Grammar indicator */
+    .presenceRow{display:flex; margin:10px 0; align-items:flex-start;}
+    .presenceGlyph{
+      max-width:min(var(--contentMax), 100%);
+      padding:2px 0;
+      font-size:20px;
+      line-height:1;
+      color:rgba(255,255,255,.70);
+      user-select:none;
     }
-    .msg.system .bubble{
-      background:rgba(255,255,255,.04);
-      border-color:rgba(255,255,255,.10);
-      color:rgba(255,255,255,.80);
+    .breatheDot{
+      width:10px;height:10px;border-radius:999px;
+      background:rgba(255,255,255,.70);
+      display:inline-block;
+      transform-origin:center;
+      animation: breathe 1.15s ease-in-out infinite;
+      box-shadow:0 0 0 6px rgba(255,255,255,.06);
     }
-    .msg.system .meta{color:rgba(255,255,255,.38)}
+    @keyframes breathe{
+      0%{ transform:scale(.92); opacity:.55; }
+      50%{ transform:scale(1.08); opacity:.90; }
+      100%{ transform:scale(.92); opacity:.55; }
+    }
+  
+    /* Tool artifact styling (ChatGPT-like: subtle label + code block) */
+    .toolLabel{
+      font-family:var(--mono);
+      font-size:12px;
+      color:rgba(255,255,255,.62);
+      margin:0 0 8px 0;
+      letter-spacing:.01em;
+      user-select:text;
+    }
+    .aliceProse pre{
+      margin:0 0 12px 0;
+      padding:10px 12px;
+      border-radius:14px;
+      border:1px solid rgba(255,255,255,.12);
+      background:rgba(0,0,0,.28);
+      font-family:var(--mono);
+      font-size:12px;
+      overflow:auto;
+      max-width:100%;
+      line-height:1.45;
+      color:rgba(255,255,255,.88);
+      white-space:pre;
+    }
+    .aliceProse .sources{
+      margin-top:12px;
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:14px;
+      background:rgba(0,0,0,.16);
+      padding:8px 10px;
+    }
+    .aliceProse .sources > summary{
+      cursor:pointer;
+      font-size:12px;
+      color:rgba(255,255,255,.75);
+      list-style:none;
+      user-select:none;
+      display:flex;
+      align-items:center;
+      gap:8px;
+    }
+    .aliceProse .sources > summary::-webkit-details-marker{display:none}
+    .aliceProse .sourcesList{
+      margin:10px 0 0 0;
+      padding:0;
+      list-style:none;
+      display:flex;
+      flex-direction:column;
+      gap:6px;
+    }
+    .aliceProse .src{
+      font-size:12px;
+      color:rgba(255,255,255,.70);
+      overflow-wrap:anywhere;
+    }
+    .aliceProse .src a{
+      color:rgba(210,245,255,.95);
+      text-decoration:none;
+      border-bottom:1px solid rgba(56,189,248,.25);
+    }
+    .aliceProse .src a:hover{border-bottom-color:rgba(56,189,248,.55)}
+
   </style>
 </head>
 
@@ -583,7 +692,7 @@
     <button class="x" id="toastClose" type="button" aria-label="Close">×</button>
   </div>
 
-    <script>
+  <script>
 (() => {
   'use strict';
 
@@ -631,6 +740,8 @@
     taskResume: (id) => `/tasks/${id}/resume`,
     taskAbort: (id) => `/tasks/${id}/abort`,
 
+    toolsCall: '/tools/call',
+
     memoryCandidates: {
       concepts: [
         '/alice/memory/concepts',
@@ -651,19 +762,378 @@
     tasksOpen: false,
     tasks: [],
 
-    // Memory mediation state (UI-side; prevents "yes-to-what?" loops)
     pendingMemory: null,     // { kind:'write'|'delete', key:'...' }
 
-    memoryEndpoints: {
-      conceptsBase: null,    // resolved GET/POST endpoint for concepts list/create
-    },
+    memoryEndpoints: { conceptsBase: null },
 
-    // UI arbiter state (non-conversational)
     lastDecision: null,      // 'RESTRAIN'|'CLARIFY'|'ADVANCE_OK'|null
 
-    // Restraint whisper throttling (prevents spam, keeps it human)
-    restrain: { lastAt: 0, lastReason: '', streak: 0 },
+    presence: { mode: 'off' }, // 'off'|'breathing'|'ellipsis'
+
+
+    // ---------- Local read cursor (v4-B) ----------
+    // Conversation-local cursor to support chunked reads without raising caps.
+    localRead: {
+      lastPath: null,
+      lastChunk: 200,
+      cursorByPath: {}, // path -> next_start_line (1-based)
+    },
   };
+  // ---------- Identity (v4-A minimal) ----------
+  // For now, user_id is a simple stable identifier provided by the client.
+  // No UI for this yet; default to "tim". (Can be overridden manually via localStorage.)
+  function getUserId() {
+    try {
+      const v = (localStorage.getItem('isac_user_id') || '').trim();
+      if (v) return v;
+    } catch {}
+    return 'tim';
+  }
+
+  // ---------- Tools (retrieval-only unified flow) ----------
+  function isShowSourcesRequest(text) {
+    const t = String(text || '').toLowerCase();
+    return t.includes('show sources') || t.includes('sources') || t.includes('where did') || t.includes('citation');
+  }
+  function isShowToolOutputRequest(text) {
+    const t = String(text || '').toLowerCase();
+    return t.includes('show tool') || t.includes('show output') || t.includes('raw') || t.includes('details');
+  }
+
+  async function toolsCall(tool_name, purpose, args) {
+    const chatId = state.chat?.id || 'unknown';
+    const userId = getUserId();
+    const headers = {
+      'X-ISAC-USER-ID': userId,
+      'X-ISAC-CHAT-ID': chatId,
+    };
+    const body = { tool_name, purpose, args: args || {} };
+    return await fetchJson(API.toolsCall, { method: 'POST', headers, body: JSON.stringify(body) });
+  }
+
+  function basename(p) {
+    const s = String(p || '').trim();
+    if (!s) return '';
+    const parts = s.split('/');
+    return parts[parts.length - 1] || s;
+  }
+
+  // ----- Local read cursor helpers (v4-B) -----
+  function _lrNormalizePath(p) {
+    return String(p || '').trim();
+  }
+
+  function _lrGetChunkDefault() {
+    const n = parseInt(state.localRead?.lastChunk || 200, 10);
+    return (Number.isFinite(n) && n > 0) ? Math.min(400, n) : 200; // conservative cap
+  }
+
+  function _lrGetNextStart(path) {
+    const p = _lrNormalizePath(path);
+    if (!p) return 1;
+    const cur = state.localRead?.cursorByPath?.[p];
+    const n = parseInt(cur || 1, 10);
+    return (Number.isFinite(n) && n >= 1) ? n : 1;
+  }
+
+  function _lrSetCursor(path, nextStart) {
+    const p = _lrNormalizePath(path);
+    if (!p) return;
+    const ns = parseInt(nextStart || 1, 10);
+    if (!Number.isFinite(ns) || ns < 1) return;
+    if (!state.localRead) state.localRead = { lastPath: null, lastChunk: 200, cursorByPath: {} };
+    if (!state.localRead.cursorByPath) state.localRead.cursorByPath = {};
+    state.localRead.cursorByPath[p] = ns;
+    state.localRead.lastPath = p;
+  }
+
+  function _lrSetLast(path, chunkSize) {
+    const p = _lrNormalizePath(path);
+    if (!p) return;
+    if (!state.localRead) state.localRead = { lastPath: null, lastChunk: 200, cursorByPath: {} };
+    state.localRead.lastPath = p;
+    const cs = parseInt(chunkSize || state.localRead.lastChunk || 200, 10);
+    if (Number.isFinite(cs) && cs > 0) state.localRead.lastChunk = Math.min(400, cs);
+  }
+
+  function _lrResolveContinuePath() {
+    return _lrNormalizePath(state.localRead?.lastPath || '');
+  }
+
+  function renderSourcesDetails(prov) {
+    const sources = Array.isArray(prov?.sources) ? prov.sources : [];
+    if (!sources.length) return '';
+    const items = sources.slice(0, 12).map(src => {
+      const u = String(src || '');
+      const safe = esc(u);
+      const isUrl = /^https?:\/\//i.test(u);
+      return `<li class="src">${isUrl ? `<a href="${safe}" target="_blank" rel="noopener noreferrer">${safe}</a>` : safe}</li>`;
+    }).join('');
+    return `
+      <details class="sources">
+        <summary>Sources</summary>
+        <ul class="sourcesList">${items}</ul>
+      </details>
+    `;
+  }
+
+  function sayAliceArtifact(label, preText, proseText, prov, showSources = true) {
+    // Presence must disappear the instant Alice begins speaking.
+    removePresence();
+
+    const prose = document.createElement('div');
+    prose.className = 'aliceProse';
+
+    const labelHtml = label ? `<div class="toolLabel">${esc(label)}</div>` : '';
+    const preHtml = `<pre>${esc(String(preText || ''))}</pre>`;
+    const bodyHtml = (proseText ? aliceHtmlFromText(String(proseText)) : '');
+    const sourcesHtml = showSources ? renderSourcesDetails(prov) : '';
+
+    prose.innerHTML = `${labelHtml}${preHtml}${bodyHtml}${sourcesHtml}`;
+
+    addRow('alice', prose);
+
+    // Store in session transcript as a plain-text approximation (prose only, keep it simple).
+    const t = (proseText || '').toString().trim() || label || '';
+    appendMessage('alice', t);
+  }
+
+  function formatWebSummary(results) {
+    const arr = Array.isArray(results) ? results : [];
+    if (!arr.length) return 'I didn’t find any usable results.';
+    const top = arr.slice(0, 6).map(r => {
+      const title = String(r?.title || r?.url || '').trim();
+      const dom = String(r?.domain || '').trim();
+      return `- ${title}${dom ? ` (${dom})` : ''}`;
+    }).join('\n');
+    return `# Results\n${top}`;
+  }
+
+  function formatWeatherSummary(primary) {
+    try {
+      const loc = primary?.location?.name || primary?.location?.query || 'that location';
+      const daily = primary?.daily || {};
+      const dates = daily?.time || [];
+      const tmax = daily?.temperature_2m_max || [];
+      const tmin = daily?.temperature_2m_min || [];
+      const n = Math.min(3, dates.length, tmax.length, tmin.length);
+      if (!n) return `I couldn’t extract a forecast for ${loc}.`;
+      let out = `# Weather — ${loc}\n`;
+      for (let i=0;i<n;i++){
+        out += `- ${dates[i]}: ${tmin[i]}–${tmax[i]}\n`;
+      }
+      return out.trim();
+    } catch {
+      return 'I couldn’t extract a forecast.';
+    }
+  }
+
+  function parseToolCommand(userText) {
+    const raw = String(userText || '').trim();
+    const low = raw.toLowerCase();
+
+    // WEB: "search the web for X"
+    let m = raw.match(/^search\s+the\s+web\s+for\s+(.+)$/i);
+    if (m && m[1]) {
+      const q = m[1].trim();
+      return {
+        tool_name: 'web.search',
+        purpose: `Find sources about: ${q}`,
+        args: {
+          intent: 'lookup',
+          user_prompt_excerpt: raw.slice(0, 180),
+          risk_tier: 2,
+          queries: [q],
+          max_results: 8,
+        },
+        render_mode: 'silent',
+      };
+    }
+
+    // LOCAL: "read file PATH"
+    m = raw.match(/^read\s+file\s+(.+)$/i);
+    if (m && m[1]) {
+      const p = m[1].trim();
+      // v4-B: remember this file for subsequent 'continue' chunk reads
+      _lrSetLast(p, _lrGetChunkDefault());
+      return {
+        tool_name: 'local.read_file',
+        purpose: `Read file for context: ${p}`,
+        args: { path: p },
+        render_mode: 'card',
+      };
+    }
+
+    // LOCAL: "read lines A-B of PATH"
+    m = raw.match(/^read\s+lines?\s+(\d+)\s*-\s*(\d+)\s+of\s+(.+)$/i);
+    if (m && m[1] && m[2] && m[3]) {
+      const a = parseInt(m[1], 10);
+      const b = parseInt(m[2], 10);
+      const p = m[3].trim();
+      // v4-B: remember this file for subsequent 'continue' chunk reads
+      _lrSetLast(p, Math.min(400, Math.max(1, (b - a + 1))));
+      return {
+        tool_name: 'local.read_snippet',
+        purpose: `Read lines ${a}-${b} for context: ${p}`,
+        args: { path: p, start_line: a, end_line: b },
+        render_mode: 'card',
+      };
+    }
+
+    // LOCAL (v4-B): "read next N lines of PATH" (chunked, cursor-based)
+    // Examples:
+    //   read next 200 lines of /opt/jarvis/brain/main.py
+    //   read next lines of /opt/jarvis/brain/main.py   (uses lastChunk)
+    m = raw.match(/^read\s+next(?:\s+(\d+))?\s+lines?\s+of\s+(.+)$/i);
+    if (m && m[2]) {
+      const n = m[1] ? parseInt(m[1], 10) : _lrGetChunkDefault();
+      const p = m[2].trim();
+      const size = (Number.isFinite(n) && n > 0) ? Math.min(400, n) : _lrGetChunkDefault();
+      const start = _lrGetNextStart(p);
+      const end = start + size - 1;
+      _lrSetLast(p, size);
+      return {
+        tool_name: 'local.read_snippet',
+        purpose: `Read next ${size} lines for context: ${p}`,
+        args: { path: p, start_line: start, end_line: end },
+        render_mode: 'card',
+      };
+    }
+
+    // LOCAL (v4-B): "continue" / "next" to read the next chunk of the last file
+    if (/^(continue|next|more|read\s+next)$/i.test(raw)) {
+      const p = _lrResolveContinuePath();
+      if (p) {
+        const size = _lrGetChunkDefault();
+        const start = _lrGetNextStart(p);
+        const end = start + size - 1;
+        _lrSetLast(p, size);
+        return {
+          tool_name: 'local.read_snippet',
+          purpose: `Read next ${size} lines for context: ${p}`,
+          args: { path: p, start_line: start, end_line: end },
+          render_mode: 'card',
+        };
+      }
+      // If no lastPath, fall through to normal handling.
+    }
+
+
+    // UTILITY: "weather LOCATION"
+    m = raw.match(/^weather\s+(.+)$/i);
+    if (m && m[1]) {
+      const loc = m[1].trim();
+      return {
+        tool_name: 'util.weather',
+        purpose: `Get weather for: ${loc}`,
+        args: { location: loc, days: 3 },
+        render_mode: 'silent',
+      };
+    }
+
+    // UTILITY: "calc EXPR"
+    m = raw.match(/^calc\s+(.+)$/i);
+    if (m && m[1]) {
+      const expr = m[1].trim();
+      return {
+        tool_name: 'util.calc',
+        purpose: 'Evaluate a basic expression',
+        args: { expression: expr },
+        render_mode: 'silent',
+      };
+    }
+
+    // UTILITY: "time OFFSET"
+    m = raw.match(/^time\s+([+-]\d{2}:\d{2}|utc|z)$/i);
+    if (m && m[1]) {
+      const off = m[1].toUpperCase() === 'UTC' ? '+00:00' : (m[1].toUpperCase() === 'Z' ? '+00:00' : m[1]);
+      return {
+        tool_name: 'util.time',
+        purpose: `Get current time for offset ${off}`,
+        args: { offset: off },
+        render_mode: 'silent',
+      };
+    }
+
+    return null;
+  }
+
+  async function handleToolCommand(cmd, userText) {
+    // Run tool via backend
+    const data = await toolsCall(cmd.tool_name, cmd.purpose, cmd.args);
+    const r = data?.result || {};
+    const ok = !!r.ok;
+
+    // Policy: failures always surface as artifact
+    const forceCard = !ok || cmd.render_mode === 'card' || isShowToolOutputRequest(userText);
+
+    if (cmd.tool_name.startsWith('local.')) {
+      // LOCAL_READ: tool output *is* deliverable
+      const p = cmd.args?.path || '';
+      const label = `${cmd.tool_name} on ${basename(p) || 'file'}`;
+      if (!ok) {
+        sayAliceArtifact(label, String(r.failure_message || 'Tool failed'), '', r.provenance, false);
+        return;
+      }
+      if (cmd.tool_name === 'local.read_snippet') {
+        const lines = Array.isArray(r.primary?.lines) ? r.primary.lines : [];
+        const pre = lines.join('\n');
+
+
+        // v4-B: advance cursor for this path (best-effort)
+        try {
+          const p2 = String(cmd.args?.path || '').trim();
+          const endLine = parseInt(cmd.args?.end_line || 0, 10);
+          if (p2 && Number.isFinite(endLine) && endLine >= 1) _lrSetCursor(p2, endLine + 1);
+        } catch {}
+        sayAliceArtifact(label, pre, '', r.provenance, false);
+        return;
+      } else {
+        const content = String(r.primary?.content || '');
+        sayAliceArtifact(label, content, '', r.provenance, false);
+        return;
+      }
+    }
+
+    // WEB / UTILITY
+    if (forceCard) {
+      const label = `${cmd.tool_name}`;
+      const pre = ok ? JSON.stringify(r.primary || {}, null, 2) : String(r.failure_message || 'Tool failed');
+      const prose = ok ? '' : '';
+      sayAliceArtifact(label, pre, prose, r.provenance);
+      return;
+    }
+
+    // Silent default: synthesize in prose
+    if (!ok) {
+      // Even in silent mode, a failure should surface
+      const label = `${cmd.tool_name}`;
+      sayAliceArtifact(label, String(r.failure_message || 'Tool failed'), '', r.provenance, false);
+      return;
+    }
+
+    let prose = '';
+    if (cmd.tool_name === 'web.search') {
+      prose = formatWebSummary(r.primary?.results || []);
+    } else if (cmd.tool_name === 'util.weather') {
+      prose = formatWeatherSummary(r.primary || {});
+    } else if (cmd.tool_name === 'util.calc') {
+      prose = `# Result\n- ${String(r.primary?.expression || '')} = ${String(r.primary?.result ?? '')}`;
+    } else if (cmd.tool_name === 'util.time') {
+      prose = `# Time\n- UTC: ${String(r.primary?.utc_now || '')}\n- Local (${String(r.primary?.offset || '')}): ${String(r.primary?.local_now || '')}`;
+    } else {
+      prose = '# Result\n' + JSON.stringify(r.primary || {}, null, 2);
+    }
+
+    // Add sources panel only when user asked for sources (ChatGPT-like)
+    if (isShowSourcesRequest(userText)) {
+      sayAliceArtifact('', '', prose, r.provenance);
+    } else {
+      sayAlice(stripSpeakerPrefix(prose));
+    }
+  }
+
+
 
   // ---------- Utilities ----------
   const esc = (s) => String(s ?? '')
@@ -673,9 +1143,10 @@
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
 
-  function nowTime() {
-    try { return new Date().toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' }); }
-    catch { return ''; }
+  function stripSpeakerPrefix(text) {
+    const t = String(text || '').trim();
+    // Guardrail: backend should never emit this, but we fail-safe in the renderer.
+    return t.replace(/^(alice|assistant|jarvis)\s*:\s*/i, '').trim();
   }
 
   function toast(msg) {
@@ -724,6 +1195,22 @@
   function scrollToBottom() {
     if (!els.scroll) return;
     els.scroll.scrollTop = els.scroll.scrollHeight;
+  }
+
+  // ---------- Micro-timing (v3 polish) ----------
+  // ChatGPT-like cadence: ACK dot appears immediately, then a short, human pause before any visible response.
+  const TIMING = {
+    minAckMs: 140,        // minimum time the breathing dot should be visible
+    restraintResolveMs: 180, // breathing dot → ellipsis
+  };
+  let _ackStartedAt = 0;
+
+  function markAckStart() { _ackStartedAt = performance.now(); }
+  async function ensureMinAck(ms) {
+    const want = (typeof ms === 'number') ? ms : TIMING.minAckMs;
+    const elapsed = performance.now() - (_ackStartedAt || 0);
+    const remain = want - elapsed;
+    if (remain > 0) await new Promise(r => setTimeout(r, Math.min(600, remain)));
   }
 
   // ---------- Transcript (session-only) ----------
@@ -776,67 +1263,155 @@
       role,                // 'me' | 'alice' | 'system'
       text: String(text ?? ''),
       ts: Date.now(),
-      kind: 'bubble'
     };
     state.chat.messages.push(msg);
-    const MAX = 200;
+    const MAX = 220;
     if (state.chat.messages.length > MAX) state.chat.messages = state.chat.messages.slice(-MAX);
     persistChatToSession();
   }
 
-  // ---------- Bubbles ----------
-  function addBubble(role, html) {
+  // ---------- v3 Presence Grammar ----------
+  // Immediate acknowledgment = breathing dot.
+  // Dot disappears at the instant Alice begins speaking.
+  // If RESTRAIN: breathing dot resolves to static “…” (no animation, no escalation).
+  const PRESENCE_ID = 'presenceRow';
+
+  function removePresence() {
+    const el = document.getElementById(PRESENCE_ID);
+    if (el) el.remove();
+    state.presence.mode = 'off';
+    document.body.classList.remove('restrained');
+  }
+
+  function showPresence(mode) {
+    removePresence();
+    if (!els.messages) return;
+
+    if (mode !== 'breathing' && mode !== 'ellipsis') return;
+
+    const row = document.createElement('div');
+    row.className = 'presenceRow';
+    row.id = PRESENCE_ID;
+    const glyph = document.createElement('div');
+    glyph.className = 'presenceGlyph';
+
+    if (mode === 'breathing') {
+      glyph.innerHTML = `<span class="breatheDot" aria-label="Alice is engaged"></span>`;
+    } else {
+      glyph.textContent = '…';
+      glyph.setAttribute('aria-label', 'Alice is listening');
+    }
+
+    row.appendChild(glyph);
+    els.messages.appendChild(row);
+    state.presence.mode = mode;
+    document.body.classList.toggle('restrained', mode === 'ellipsis');
+    scrollToBottom();
+  }
+
+  // ---------- Renderers ----------
+  function addRow(role, node) {
     if (!els.messages) return;
 
     const row = document.createElement('div');
     row.className = `msg ${role === 'me' ? 'me' : role === 'system' ? 'system' : ''}`;
-
-    if (role !== 'me') {
-      const avatar = document.createElement('div');
-      avatar.className = 'avatar';
-      avatar.textContent = (role === 'system') ? '•' : 'A';
-      row.appendChild(avatar);
-    }
-
-    const bubble = document.createElement('div');
-    bubble.className = 'bubble';
-    bubble.innerHTML = html;
-
-    row.appendChild(bubble);
-
-    const meta = document.createElement('div');
-    meta.className = 'meta';
-    meta.textContent = nowTime();
-    bubble.appendChild(meta);
-
+    row.appendChild(node);
     els.messages.appendChild(row);
     scrollToBottom();
   }
 
   function sayMe(text) {
     const t = String(text ?? '');
-    addBubble('me', `<div>${esc(t)}</div>`);
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.innerHTML = `<div>${esc(t)}</div>`;
+    addRow('me', bubble);
     appendMessage('me', t);
   }
 
-  // NOTE: Alice speech is ONLY allowed via the Response Arbiter.
-  function sayAliceSpeech(text) {
+  // Alice: free-flow prose, no bubble.
+  function aliceHtmlFromText(text) {
+    const raw = String(text ?? '').replace(/\r\n/g, '\n').trim();
+    if (!raw) return '<p>(no reply)</p>';
+
+    const lines = raw.split('\n');
+    const blocks = [];
+    let para = [];
+    let list = [];
+
+    const flushPara = () => {
+      if (!para.length) return;
+      blocks.push({ type:'p', text: para.join(' ').trim() });
+      para = [];
+    };
+    const flushList = () => {
+      if (!list.length) return;
+      blocks.push({ type:'ul', items: list.slice() });
+      list = [];
+    };
+
+    for (let i=0; i<lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) { flushList(); flushPara(); continue; }
+
+      // Headings (# / ##). Keep minimal and predictable.
+      if (line.startsWith('## ')) { flushList(); flushPara(); blocks.push({ type:'h4', text: line.slice(3).trim() }); continue; }
+      if (line.startsWith('# '))  { flushList(); flushPara(); blocks.push({ type:'h3', text: line.slice(2).trim() }); continue; }
+
+      // Bullets (minimal)
+      if (line.startsWith('- ') || line.startsWith('• ')) {
+        flushPara();
+        list.push(line.slice(2).trim());
+        continue;
+      }
+
+      flushList();
+      para.push(line);
+    }
+    flushList();
+    flushPara();
+
+    const out = [];
+    for (const b of blocks) {
+      if (b.type === 'h3') out.push(`<h3>${esc(b.text)}</h3>`);
+      else if (b.type === 'h4') out.push(`<h4>${esc(b.text)}</h4>`);
+      else if (b.type === 'ul') out.push(`<ul>${b.items.map(it => `<li>${esc(it)}</li>`).join('')}</ul>`);
+      else out.push(`<p>${esc(b.text)}</p>`);
+    }
+    return out.join('');
+  }
+
+  function sayAlice(text) {
+    // Presence dot must disappear the instant Alice begins speaking.
+    removePresence();
+
     const t = String(text ?? '');
-    addBubble('alice', `<div>${esc(t)}</div>`);
+    const prose = document.createElement('div');
+    prose.className = 'aliceProse';
+    prose.innerHTML = aliceHtmlFromText(t);
+
+    addRow('alice', prose);
     appendMessage('alice', t);
   }
 
-  // System (non-conversational) note: factual, brief, never Alice voice
+  // System note: factual, brief, never Alice voice.
   function systemNote(text) {
+    removePresence();
     const t = String(text ?? '');
-    addBubble('system', `<div>${esc(t)}</div>`);
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.innerHTML = `<div>${esc(t)}</div>`;
+    addRow('system', bubble);
     appendMessage('system', t);
   }
 
   function systemCard(title, bodyHtml) {
+    removePresence();
     const ttl = String(title ?? '').trim();
-    const html = `<div class="card"><h4>${esc(ttl)}</h4>${bodyHtml || ''}</div>`;
-    addBubble('system', html);
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.innerHTML = `<div class="card"><h4>${esc(ttl)}</h4>${bodyHtml || ''}</div>`;
+    addRow('system', bubble);
     appendMessage('system', `${ttl}`);
   }
 
@@ -845,7 +1420,22 @@
     els.messages.innerHTML = '';
     const msgs = state.chat?.messages || [];
     for (const m of msgs) {
-      addBubble(m.role === 'me' ? 'me' : (m.role === 'system' ? 'system' : 'alice'), `<div>${esc(m.text)}</div>`);
+      if (m.role === 'me') {
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+        bubble.innerHTML = `<div>${esc(m.text)}</div>`;
+        addRow('me', bubble);
+      } else if (m.role === 'system') {
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+        bubble.innerHTML = `<div>${esc(m.text)}</div>`;
+        addRow('system', bubble);
+      } else {
+        const prose = document.createElement('div');
+        prose.className = 'aliceProse';
+        prose.innerHTML = aliceHtmlFromText(m.text);
+        addRow('alice', prose);
+      }
     }
     scrollToBottom();
   }
@@ -867,10 +1457,6 @@
     return out.trim();
   }
 
-
-
-  // Build structured context for the legitimacy gate.
-  // The gate expects an array like: [{role:"user"|"assistant", content:"..."}]
   function buildCtxArrayForGate(opts) {
     const excludeLast = opts?.excludeLast ?? false;
     let msgs = (state.chat?.messages || []).filter(m => m.role !== 'system');
@@ -885,6 +1471,7 @@
       })
       .filter(m => m.content);
   }
+
   // ---------- Fail-closed behavior ----------
   function setFailClosed(on, details) {
     const disabled = !!on;
@@ -960,35 +1547,14 @@
     try { return JSON.stringify(x); } catch { return String(x); }
   }
 
-
   function firstQuestionOnly(q) {
     const s = String(q || '').trim();
     if (!s) return '';
-    // If multiple questions appear, keep only the first one (tight CLARIFY contract).
     const qm = s.indexOf('?');
     if (qm !== -1) return (s.slice(0, qm + 1)).trim();
-    // Otherwise keep just the first line.
     return s.split('\n').map(x => x.trim()).filter(Boolean)[0] || s;
   }
 
-  function restraintWhisper(reason) {
-    const now = Date.now();
-    const r = String(reason || '').trim();
-    const same = (r && r === state.restrain.lastReason);
-    const within = (now - (state.restrain.lastAt || 0)) < 2500;
-
-    // Presence cue only. Never instruct wake words. Never auto-advance.
-    // Throttle repeats so we don't spam "Listening." on rapid retries.
-    if (within && same) {
-      state.restrain.streak = (state.restrain.streak || 1) + 1;
-      return null;
-    }
-
-    state.restrain.streak = 1;
-    state.restrain.lastReason = r || null;
-    state.restrain.lastAt = now;
-    return 'Listening.';
-  }
   async function fetchJson(url, opts = {}) {
     const res = await fetch(url, {
       method: opts.method || 'GET',
@@ -1184,7 +1750,7 @@
     }
   }
 
-  // ---------- Memory (system UI only) ----------
+  // ---------- Memory (system UI only; unchanged behavior) ----------
   async function resolveConceptsBase() {
     if (state.memoryEndpoints.conceptsBase) return state.memoryEndpoints.conceptsBase;
 
@@ -1304,40 +1870,27 @@
     return true;
   }
 
-  // ---------- Response Arbiter ----------
-  function normalizeDecisionObject(data) {
-    if (!data || typeof data !== 'object') {
-      return { decision: 'ADVANCE_OK', text: String(data ?? '') };
-    }
-
-    const decision = String(data.decision || data.outcome || data.gate || '').toUpperCase().trim();
-
-    if (decision === 'RESTRAIN') return { decision: 'RESTRAIN' };
-
-    if (decision === 'CLARIFY') {
-        // Exactly one question bubble, no extra commentary. If multiple questions arrive, keep only the first.
-        let q = String(gate?.question || '').trim();
-        q = firstQuestionOnly(q);
-
-        // If the gate didn't supply a question, fall back to a single, minimal prompt.
-        if (!q) q = 'What would you like me to do with that?';
-        setSubtitle('Alice asked a clarification.');
-        sayAliceSpeech(q);
-        return;
-      }
-
-    setSubtitle('Conversation-first. Tasks only appear when you ask.');
-    sayAliceSpeech(d.text || '(no reply)');
-  }
-
   // ---------- /ask ----------
   const ALICE_SYSTEM_PROMPT = [
     "You are Alice, the sole human-facing assistant.",
     "ISAC is the silent backend. Never mention ISAC, never identify as ISAC, and never say you are ISAC.",
     "Conversation is the authority spine. Be concise, clear, and practical.",
     "If a user asks you to remember something, ask for explicit confirmation before any memory write.",
-    "If you cannot perform an action, explain why and suggest the next safe step."
+    "If you cannot perform an action, explain why and suggest the next safe step.",
+    "Emoji, if any, must be sparse and intentional."
   ].join("\n");
+
+  // Guard against any accidental /ask bypass paths.
+  // Only sendAsk() is allowed to call /ask, and only after the gate returns ADVANCE_OK.
+  let ASK_ALLOWED = false;
+  async function askModel(url, opts) {
+    if (!ASK_ALLOWED) {
+      const err = new Error('ASK_BYPASS_BLOCKED');
+      err.status = 499;
+      throw err;
+    }
+    return await fetchJson(url, opts);
+  }
 
   async function sendAsk(text) {
     try {
@@ -1346,40 +1899,34 @@
 
       // 1) Legitimacy gate (v2): decide whether Alice may speak.
       const gateCtx = buildCtxArrayForGate({ excludeLast: true });
-      // Backend owns semantic intent. No wake words, no name-prefix requirements.
-      const gatePayload = {
-        msg: raw,
-        ctx: gateCtx,
-        mode: 'normal',
-        flags: {}
-};
+      const gatePayload = { msg: raw, ctx: gateCtx, mode: 'normal', flags: {} };
 
       const gate = await fetchJson(API.gateAdvance, { method:'POST', body: JSON.stringify(gatePayload) });
       const decision = String(gate?.decision || '').toUpperCase().trim();
+      try { console.debug('[gate]', { msg: raw, decision, reason: gate?.reason, question: gate?.question }); } catch {}
       state.lastDecision = decision || null;
 
       if (decision === 'RESTRAIN') {
-        // Silence: no Alice bubble. A single, throttled system whisper keeps it human without being chatty.
+        // v3: breathing dot resolves into static “…” after a brief human pause.
         setSubtitle('Listening.');
-
-        const why = Array.isArray(gate?.reasons) ? gate.reasons.join(', ') : '';
-        const whisper = restraintWhisper(why);
-        if (whisper) systemNote(whisper);
-
-        // Deliberately do NOT print raw gate reasons into the chat.
+        await ensureMinAck(TIMING.restraintResolveMs);
+        showPresence('ellipsis');
         return;
       }
 
       if (decision === 'CLARIFY') {
-        // Exactly one question bubble, no extra commentary.
-        const q = String(gate?.question || '').trim();
+        // v3: dot disappears at expression start; exactly one question.
+        const qRaw = firstQuestionOnly(String(gate?.question || '').trim()) || 'What would you like me to do with that?';
+        const q = stripSpeakerPrefix(qRaw);
         setSubtitle('Alice asked a clarification.');
-        if (q) sayAliceSpeech(q);
-        else systemNote('Clarification requested.');
+        await ensureMinAck();
+        await new Promise(requestAnimationFrame);
+        sayAlice(q);
         return;
       }
 
       // 2) ADVANCE_OK: ask the model for a normal reply.
+      await ensureMinAck();
       const ctx = buildContextBlockForModel({ excludeLast: true });
       const composed = ctx ? (ctx + "\n\nUser: " + raw) : raw;
       const payload = { message: composed, system_prompt: ALICE_SYSTEM_PROMPT };
@@ -1392,7 +1939,9 @@
         ASK_ALLOWED = false;
       }
 
-      const replyText = String(data?.reply || data?.answer || data?.response || data?.text || '');
+      const replyText = stripSpeakerPrefix(String(data?.reply || data?.answer || data?.response || data?.text || '').trim());
+
+      // Identity boundary: block any "I am ISAC" leaks.
       const leak = /\b(i\s*['’]?m|i\s*am)\s+isac\b/i.test(replyText) || /\bisac\b\s*(brain|backend)/i.test(replyText);
       if (leak) {
         systemNote('Response blocked (identity boundary).');
@@ -1400,7 +1949,8 @@
       }
 
       setSubtitle('Conversation-first. Tasks only appear when you ask.');
-      sayAliceSpeech(String(replyText || '(no reply)').trim());
+      await new Promise(requestAnimationFrame);
+      sayAlice(replyText || '(no reply)');
 
       // Memory suggestion hooks (system-only confirmation loop)
       const m1 = replyText.match(/remember\s*[“"']([^”"']+)[”"']/i);
@@ -1410,6 +1960,8 @@
       if (f1?.[1]) setPending('delete', f1[1]);
 
     } catch (e) {
+      // Any error ends presence indicator (no dangling dot).
+      removePresence();
       const code = e.status ? `HTTP ${e.status}` : 'ERR';
       systemNote(`Request failed (${code}).`);
       systemCard('ERROR · Request failed', `<pre>${esc(String(e.message || 'Unknown error').slice(0, 1200))}</pre>`);
@@ -1459,6 +2011,21 @@
       return;
     }
 
+    // Tool command routing (v4-A unified tool-call flow)
+    const cmd = parseToolCommand(t);
+    if (cmd) {
+      try {
+        await handleToolCommand(cmd, t);
+      } catch (e) {
+        removePresence();
+        const code = e.status ? `HTTP ${e.status}` : 'ERR';
+        systemNote(`Tool call failed (${code}).`);
+        systemCard('ERROR · Tool call failed', `<pre>${esc(String(e.message || 'Unknown error').slice(0, 1200))}</pre>`);
+        setHealth(false);
+      }
+      return;
+    }
+
     await sendAsk(t);
   }
 
@@ -1472,9 +2039,19 @@
   function onSend() {
     const text = String(els.input?.value || '').trim();
     if (!text) return;
+
     els.input.value = '';
     autosize();
+
+    // 1) User message enters transcript.
     sayMe(text);
+
+    // 2) v3 Presence: immediate acknowledgment on input receipt.
+    // Dot = engagement, not thinking.
+    showPresence('breathing');
+    markAckStart();
+
+    // 3) Route command / ask.
     void handle(text);
   }
 
@@ -1522,19 +2099,6 @@
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
-
-  // Guard against any accidental /ask bypass paths.
-  // Only sendAsk() is allowed to call /ask, and only after the gate returns ADVANCE_OK.
-  let ASK_ALLOWED = false;
-
-  async function askModel(url, opts) {
-    if (!ASK_ALLOWED) {
-      const err = new Error('ASK_BYPASS_BLOCKED');
-      err.status = 499;
-      throw err;
-    }
-    return await fetchJson(url, opts);
-  }
 })();
   </script>
 </body>

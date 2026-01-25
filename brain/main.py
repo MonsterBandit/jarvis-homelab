@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Literal
 
+# Service start time (monotonic) for /verify uptime
+START_TIME = time.monotonic()
 
 import httpx
 import psutil
@@ -152,7 +154,10 @@ from system_health_capture import capture_system_health
 from services.irr_ups import router as irr_router
 from services.irr_narrative import router as irr_narrative_router
 from services.finance_reader import summarize_finances, list_transactions, FinanceSnapshotError
-from services.task_ledger import create_task, add_step, add_artifact
+from tools.task_ledger import create_task, add_step, add_artifact, create_tool_call_task
+from tools.executor import run_tool
+from tools.registry import TOOL_DEFS, is_known_tool, is_tool_allowed
+from tools.types import ToolRequest
 
 
 # ---------------------------------------------------------
@@ -2181,6 +2186,29 @@ async def ping() -> Dict[str, Any]:
     return {"status": "ok", "message": "ISAC brain is alive"}
 
 
+@app.get("/verify", dependencies=[Depends(require_api_key)])
+async def verify() -> Dict[str, Any]:
+    """
+    Read-only verification endpoint.
+    Designed for autonomy auto-verify and human confidence checks.
+    No side effects. No external calls. No persistence.
+    """
+    uptime_seconds = int(time.monotonic() - START_TIME)
+
+    return {
+        "service": "isac-brain",
+        "version": app.version,
+        "commit": os.getenv("GIT_COMMIT") or os.getenv("CF_PAGES_COMMIT_SHA"),
+        "uptime_seconds": uptime_seconds,
+        "server_time_utc": datetime.now(timezone.utc).isoformat(),
+        "tool_allowlist": {
+            "web": ["search", "open", "find", "click", "screenshot_pdf"],
+            "local": ["read_file", "read_snippet"],
+            "utility": ["time", "calc", "weather"],
+        },
+    }
+
+
 @health_router.get("/isac_internal")
 async def health_isac_internal(
     _admin_ok: None = Depends(require_admin_if_configured),
@@ -2621,6 +2649,11 @@ def _task_update_status(task_id: int, status: str) -> None:
         conn.close()
 
 
+def _task_mark_completed(task_id: int) -> None:
+    # Canonical task status used throughout the spine
+    _task_update_status(task_id, "completed")
+
+
 def _task_get_min(task_id: int) -> Dict[str, Any]:
     conn = _task_db_connect()
     try:
@@ -2956,6 +2989,148 @@ def create_tooling_probe_task(
         description="Task created (pending). Resume will capture tooling_probe snapshot.",
     )
     return {"ok": True, "task_id": task_id}
+
+
+@app.post(
+    "/tasks/create/tool_call",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+def create_tool_call(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    v4-A: Create a pending tool_call task.
+
+    Contract:
+    - Admin-gated.
+    - Creates a task ledger entry plus a tool_request artifact.
+    - Execution occurs only via POST /tasks/{task_id}/resume.
+    """
+    tool_name = str(body.get("tool_name") or "").strip()
+    purpose = str(body.get("purpose") or "").strip()
+    args = body.get("args") or {}
+
+    if not tool_name:
+        raise HTTPException(status_code=400, detail="tool_name is required")
+    if not purpose:
+        raise HTTPException(status_code=400, detail="purpose is required")
+    if not isinstance(args, dict):
+        raise HTTPException(status_code=400, detail="args must be an object")
+
+    task_id = create_tool_call_task(tool_name=tool_name, args=args, purpose=purpose)
+    return {"ok": True, "task_id": task_id, "status": "pending", "tool_name": tool_name}
+
+
+
+# ---------------------------------------------------------
+# v4-A Retrieval Tool Call — READ-GATED (non-admin)
+# - Executes retrieval-only tool families immediately (WEB/UTILITY/LOCAL_READ)
+# - Still logs tool_request + tool_result to the task ledger for auditability
+# - Does NOT use /tasks/{id}/resume (which is execution/admin-gated)
+# ---------------------------------------------------------
+
+@app.post(
+    "/tools/call",
+    dependencies=[Depends(require_api_key)],
+)
+async def call_tool_readonly(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Read-gated tool execution for retrieval-only tool families.
+
+    Contract (v4-A):
+    - Read auth only (no admin required).
+    - Allowed families: WEB, UTILITY, LOCAL_READ.
+    - Full audit trail: creates a tool_call task, stores tool_request + tool_result artifacts.
+    - No UI wiring implied; this is backend-only plumbing for later unified UI flow.
+    """
+    tool_name = str(body.get("tool_name") or "").strip()
+    purpose = str(body.get("purpose") or "").strip()
+    args = body.get("args") or {}
+
+    if not tool_name:
+        raise HTTPException(status_code=400, detail="tool_name is required")
+    if not purpose:
+        raise HTTPException(status_code=400, detail="purpose is required")
+    if not isinstance(args, dict):
+        raise HTTPException(status_code=400, detail="args must be an object")
+
+    # Tool allowlist gate (v4-A baseline)
+    if not is_known_tool(tool_name):
+        raise HTTPException(status_code=403, detail="Unknown tool")
+    if not is_tool_allowed(tool_name):
+        raise HTTPException(status_code=403, detail="Tool not allowed in this phase")
+
+    tdef = TOOL_DEFS[tool_name]
+    if tdef.family.value not in {"web", "utility", "local_read"}:
+        raise HTTPException(status_code=403, detail="Tool family is not allowed for read-gated calls")
+
+    # Create task + store tool_request artifact (auditability)
+    task_id = create_tool_call_task(tool_name=tool_name, args=args, purpose=purpose)
+
+    # Best-effort evidence hooks (do not block execution lane)
+    try:
+        lineage_init(task_id=task_id, parent_task_id=None, trigger_reason="readonly: tools/call")
+    except Exception:
+        pass
+    try:
+        timing_mark_started(task_id)
+    except Exception:
+        pass
+
+    step_id = add_step(
+        task_id=task_id,
+        step_index=_task_next_step_index(task_id),
+        description=f"Execute (read-gated): tool_call → {tool_name}",
+    )
+
+    tool_req = ToolRequest(
+        tool_name=tool_name,
+        args=args,
+        purpose=purpose,
+        task_id=task_id,
+        step_id=step_id,
+        user_id=(request.headers.get("X-ISAC-USER-ID") or "unknown"),
+        chat_id=(request.headers.get("X-ISAC-CHAT-ID") or "unknown"),
+    )
+
+    result = await run_tool(tool_req)
+
+    add_artifact(
+        task_id=task_id,
+        step_id=step_id,
+        artifact_type="tool_result",
+        metadata_json=json.dumps(
+            {
+                "ok": result.ok,
+                "tool_name": result.tool_name,
+                "failure_class": (result.failure_class.value if result.failure_class else None),
+                "failure_message": result.failure_message,
+                "primary": result.primary,
+                "provenance": (result.provenance.__dict__ if result.provenance else None),
+                "started_at": result.started_at,
+                "ended_at": result.ended_at,
+                "latency_ms": result.latency_ms,
+            }
+        ),
+    )
+
+    _task_mark_completed(task_id)
+    try:
+        timing_mark_finished(task_id)
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "tool_name": tool_name,
+        "result": {
+            "ok": result.ok,
+            "primary": result.primary,
+            "failure_class": (result.failure_class.value if result.failure_class else None),
+            "failure_message": result.failure_message,
+            "provenance": (result.provenance.__dict__ if result.provenance else None),
+        },
+    }
+
 
 
 # ---------------------------------------------------------
@@ -3384,7 +3559,7 @@ def resume_task_plan(task_id: int):
     "/tasks/{task_id}/resume",
     dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
 )
-async def resume_task(task_id: int) -> Dict[str, Any]:
+async def resume_task(task_id: int, request: Request) -> Dict[str, Any]:
     """
     Resume (Execution Spine):
     - Enforces single-execution concurrency guard (v2)
@@ -3424,7 +3599,63 @@ async def resume_task(task_id: int) -> Dict[str, Any]:
     timing_mark_started(task_id)
 
     try:
-        # ---- File write (v3 template) ----
+        
+        # ---- Tool call (v4-1) ----
+        if title == "tool_call":
+            req_art = _task_get_latest_artifact(task_id, "tool_request")
+            if not req_art:
+                raise HTTPException(status_code=400, detail="Missing tool_request artifact")
+
+            meta = req_art.get("metadata") or {}
+            tool_name = str(meta.get("tool_name") or "")
+            args = meta.get("args") or {}
+            purpose = str(meta.get("purpose") or "")
+
+            step_id = add_step(
+                task_id=task_id,
+                step_index=_task_next_step_index(task_id),
+                description=f"Resume: tool_call → {tool_name}",
+            )
+
+            tool_req = ToolRequest(
+                tool_name=tool_name,
+                args=args,
+                purpose=purpose,
+                task_id=task_id,
+                step_id=step_id,
+                user_id=(request.headers.get("X-ISAC-USER-ID") or "unknown"),
+                chat_id=(request.headers.get("X-ISAC-CHAT-ID") or "unknown"),
+            )
+
+            result = await run_tool(tool_req)
+
+            add_artifact(
+                task_id=task_id,
+                step_id=step_id,
+                artifact_type="tool_result",
+                metadata_json=json.dumps(
+                    {
+                        "ok": result.ok,
+                        "tool_name": result.tool_name,
+                        "failure_class": (result.failure_class.value if result.failure_class else None),
+                        "failure_message": result.failure_message,
+                        "primary": result.primary,
+                        "provenance": (result.provenance.__dict__ if result.provenance else None),
+                    }
+                ),
+            )
+
+            _task_mark_completed(task_id)
+            # Mark task timing end (success)
+            timing_mark_finished(task_id)
+
+            return {
+                "ok": True,
+                "task_id": task_id
+            }
+
+
+# ---- File write (v3 template) ----
         if title in ("File write", "File replace"):
             proposal = _task_get_latest_artifact(task_id, "file_write_proposal")
             if not proposal:
@@ -3704,9 +3935,9 @@ async def resume_task(task_id: int) -> Dict[str, Any]:
     "/tasks/{task_id}/resume/confirm",
     dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
 )
-async def resume_task_confirm(task_id: int):
+async def resume_task_confirm(task_id: int, request: Request):
     # UI compatibility shim: confirm → execute
-    return await resume_task(task_id)
+    return await resume_task(task_id, request)
 
 # ---------------------------------------------------------
 # Home Assistant router & endpoints

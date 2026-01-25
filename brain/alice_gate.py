@@ -34,9 +34,25 @@ NO_INVITATION_INTENTS = {
     "ambient_noise",     # background / stray text
     "thinking_aloud",    # e.g., "hmm", "..."
     "no_invitation",     # explicit classification from upstream
+    "statement",       # plain statements are not an invitation; use "continuation" when engagement is intended
 }
 
 
+
+# --- Continuation phrase override (v3) ---
+CONTINUATION_PHRASES = {
+    "tell me more",
+    "go on",
+    "continue",
+    "keep going",
+    "say more",
+    "please continue",
+    "carry on",
+}
+
+def is_continuation_phrase(msg: str) -> bool:
+    m = (msg or "").strip().lower()
+    return m in CONTINUATION_PHRASES
 # Intents that *are* an invitation to engage.
 INVITATION_INTENTS = {
     "invitation",        # e.g., "can you help me?"
@@ -45,7 +61,6 @@ INVITATION_INTENTS = {
     "command",           # "do X" (still gated by capability elsewhere)
     "continuation",      # conversational continuation
     "emotional_signal",  # e.g., "ugh" (often warrants response, but may clarify)
-    "statement",         # plain statements often imply engagement in a dialog
 }
 
 
@@ -95,7 +110,10 @@ def advance_gate(
     # Preferred path: semantic intent classification from upstream (backend-owned).
     intent = str(flags.get("intent") or flags.get("semantic_intent") or "unknown").strip().lower()
 
-    if explicit_invitation:
+    if is_continuation_phrase(msg):
+        invited = True
+        reasons.append("CONTINUATION_INVITE")
+    elif explicit_invitation:
         invited = True
         reasons.append("EXPLICIT_INVITATION")
     elif intent in NO_INVITATION_INTENTS:

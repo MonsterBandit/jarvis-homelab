@@ -3,3 +3,4 @@ uvicorn[standard]
 psutil
 requests
 httpx
+PyMuPDF
