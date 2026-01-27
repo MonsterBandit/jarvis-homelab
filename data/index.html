@@ -776,6 +776,8 @@
 
     lastDecision: null,      // 'RESTRAIN'|'CLARIFY'|'ADVANCE_OK'|null
 
+    sandbox: { enabled: false, announced: false },
+
     presence: { mode: 'off' }, // 'off'|'breathing'|'ellipsis'
 
 
@@ -1067,6 +1069,10 @@
   }
 
   async function handleToolCommand(cmd, userText) {
+    if (isSandboxEnabled()) {
+      sayAlice("Sandbox boundary. Tools are disabled while sandbox is active. Say: “exit sandbox” to leave sandbox, or keep reasoning here without tools.");
+      return;
+    }
     // Run tool via backend
     const data = await toolsCall(cmd.tool_name, cmd.purpose, cmd.args);
     const r = data?.result || {};
@@ -1271,6 +1277,7 @@
       role,                // 'me' | 'alice' | 'system'
       text: String(text ?? ''),
       ts: Date.now(),
+      sandbox: !!state.sandbox?.active,
     };
     state.chat.messages.push(msg);
     const MAX = 220;
@@ -1393,7 +1400,8 @@
     // Presence dot must disappear the instant Alice begins speaking.
     removePresence();
 
-    const t = String(text ?? '');
+    let t = String(text ?? '');
+    if (isSandboxEnabled()) t = sandboxGuardText(t);
     const prose = document.createElement('div');
     prose.className = 'aliceProse';
     prose.innerHTML = aliceHtmlFromText(t);
@@ -1450,7 +1458,7 @@
 
   function buildContextBlockForModel(opts) {
     const excludeLast = opts?.excludeLast ?? false;
-    let msgs = (state.chat?.messages || []).filter(m => m.role !== 'system');
+    let msgs = (state.chat?.messages || []).filter(m => m.role !== 'system' && (state.sandbox?.active ? true : !m.sandbox));
     if (excludeLast && msgs.length) msgs = msgs.slice(0, -1);
     if (!msgs.length) return '';
     const slice = msgs.slice(-24);
@@ -1467,7 +1475,7 @@
 
   function buildCtxArrayForGate(opts) {
     const excludeLast = opts?.excludeLast ?? false;
-    let msgs = (state.chat?.messages || []).filter(m => m.role !== 'system');
+    let msgs = (state.chat?.messages || []).filter(m => m.role !== 'system' && (state.sandbox?.active ? true : !m.sandbox));
     if (excludeLast && msgs.length) msgs = msgs.slice(0, -1);
     if (!msgs.length) return [];
     const slice = msgs.slice(-24);
@@ -1784,7 +1792,72 @@
   }
 
 
-  // ---------- Command normalization & pattern routing (Natural-language pressure relief) ----------
+  
+  // ---------- Sandbox (Bundle 4) ----------
+  // UI-local exploratory mode. When enabled:
+  // - /ask requests include X-ISAC-SANDBOX: true
+  // - Alice language is constrained (hypotheticals only)
+  // - Tools/memory/execution are already hard-blocked server-side (Phase 1)
+  function isSandboxEnabled() { return !!state.sandbox?.enabled; }
+
+  function setSandboxEnabled(on) {
+    const want = !!on;
+    if (!state.sandbox) state.sandbox = { enabled:false, announced:false };
+    state.sandbox.enabled = want;
+    if (!want) state.sandbox.announced = false;
+
+    if (want) {
+      setSubtitle('Sandbox mode: exploratory. Nothing here becomes action or truth unless promoted.');
+      // Declare entry once, as Alice voice (not system).
+      if (!state.sandbox.announced) {
+        sayAlice("Sandbox mode. I can explore ideas freely, but nothing here becomes action, observation, memory, or truth unless you explicitly promote it.\n\nIf you want, say: “summarize”, “discard”, or “exit sandbox”.");
+        state.sandbox.announced = true;
+      }
+    } else {
+      setSubtitle('Conversation-first. Tasks only appear when you ask.');
+      // Gentle exit note (Alice voice).
+      sayAlice("Okay. Exiting sandbox.");
+    }
+  }
+
+  function parseSandboxCommand(rawText) {
+    const s = normalizeCommandText(rawText);
+    if (!s) return null;
+
+    // Enter
+    if (s === 'enter sandbox' || s === 'start sandbox' || s === 'sandbox on' || s === 'sandbox mode' || s === 'enable sandbox') {
+      return { kind: 'sandbox_on' };
+    }
+    // Exit
+    if (s === 'exit sandbox' || s === 'leave sandbox' || s === 'sandbox off' || s === 'disable sandbox') {
+      return { kind: 'sandbox_off' };
+    }
+    // In-sandbox helpers
+    if (s === 'summarize' || s === 'summarize sandbox') return { kind: 'sandbox_summarize' };
+    if (s === 'discard' || s === 'discard sandbox') return { kind: 'sandbox_discard' };
+    return null;
+  }
+
+  function sandboxGuardText(text) {
+    // Fail-transparent language boundary enforcement.
+    // If unsafe phrasing appears, we halt and offer bounded next steps.
+    const t = String(text || '').trim();
+    if (!t) return t;
+
+    // Forbidden: observational certainty / tool implication / memory implication / commitments.
+    const bad = [
+      /\b(i\s*(?:checked|found|saw|verified|looked\s*up|searched|pulled|retrieved))\b/i,
+      /\b(i\s*(?:will|i'll|we'll|i can|i'll go|i am going to))\b/i,
+      /\b(saved|remembered|stored|wrote to memory|added to memory|i noted)\b/i,
+      /\b(executed|ran|called|triggered)\b/i,
+    ];
+    if (bad.some(rx => rx.test(t))) {
+      return "Sandbox boundary. I started to speak as if I had observed, committed, or stored something.\n\nIf you want, say: “discard”, “summarize”, or “exit sandbox”.";
+    }
+    return t;
+  }
+
+// ---------- Command normalization & pattern routing (Natural-language pressure relief) ----------
   // Deterministic, bounded: strips harmless filler so capability commands don't fall through to /advance.
   function normalizeCommandText(raw) {
     let s = String(raw || '').trim().toLowerCase();
@@ -2054,6 +2127,8 @@ Reply “yes” to confirm, or “no” to cancel.`);
       try { console.debug('[gate]', { msg: raw, decision, reason: gate?.reason, question: gate?.question }); } catch {}
       state.lastDecision = decision || null;
 
+      
+
       if (decision === 'RESTRAIN') {
         // v3: breathing dot resolves into static “…” after a brief human pause.
         setSubtitle('Listening.');
@@ -2073,6 +2148,44 @@ Reply “yes” to confirm, or “no” to cancel.`);
         return;
       }
 
+      if (decision === 'PAUSE') {
+        // Bundle 5B pause: exactly one question.
+        const qRaw = firstQuestionOnly(String(gate?.question || '').trim()) || 'What would you like me to do with that?';
+        const q = stripSpeakerPrefix(qRaw);
+        setSubtitle('Paused for clarity.');
+        await ensureMinAck();
+        await new Promise(requestAnimationFrame);
+        sayAlice(q);
+        return;
+      }
+
+      if (decision === 'ESCALATE_ADMIN') {
+        // Bundle 5B escalation: require admin unlock before continuing.
+        const b5 = gate?.bundle5 || {};
+        const expl = Array.isArray(b5?.explanation) ? b5.explanation : [];
+        const msg = expl.length ? expl.join('\n\n') : 'Admin unlock is required to continue.';
+        setSubtitle('Admin confirmation required.');
+        await ensureMinAck();
+        await new Promise(requestAnimationFrame);
+        sayAlice(stripSpeakerPrefix(msg));
+        // Reuse the existing conversational admin unlock card (no new flow).
+        showUnlockCard();
+        return;
+      }
+
+      if (decision === 'REFUSE') {
+        // Bundle 5 refusal: render explanation and stop (no /ask).
+        const b5 = gate?.bundle5 || {};
+        const expl = Array.isArray(b5?.explanation) ? b5.explanation : [];
+        const msg = expl.length ? expl.join('\n\n') : 'I can’t proceed with that request as stated.';
+        setSubtitle('Refused (ethics/oversight).');
+        await ensureMinAck();
+        await new Promise(requestAnimationFrame);
+        sayAlice(stripSpeakerPrefix(msg));
+        return;
+      }
+
+      // 2) ADVANCE_OK:
       // 2) ADVANCE_OK: ask the model for a normal reply.
       await ensureMinAck();
       const ctx = buildContextBlockForModel({ excludeLast: true });
@@ -2082,12 +2195,13 @@ Reply “yes” to confirm, or “no” to cancel.`);
       ASK_ALLOWED = true;
       let data;
       try {
-        data = await askModel(API.ask, { method:'POST', body: JSON.stringify(payload) });
+        data = await askModel(API.ask, { method:'POST', headers: (isSandboxEnabled() ? {'X-ISAC-SANDBOX':'true'} : {}), body: JSON.stringify(payload) });
       } finally {
         ASK_ALLOWED = false;
       }
 
-      const replyText = stripSpeakerPrefix(String(data?.reply || data?.answer || data?.response || data?.text || '').trim());
+            let replyText = stripSpeakerPrefix(String(data?.reply || data?.answer || data?.response || data?.text || '').trim());
+      if (isSandboxEnabled()) replyText = sandboxGuardText(replyText);
 
       // Identity boundary: block any "I am ISAC" leaks.
       const leak = /\b(i\s*['’]?m|i\s*am)\s+isac\b/i.test(replyText) || /\bisac\b\s*(brain|backend)/i.test(replyText);
@@ -2117,10 +2231,165 @@ Reply “yes” to confirm, or “no” to cancel.`);
     }
   }
 
+
+  // ---------- Sandbox helpers (Bundle 4 Phase 3) ----------
+  const PROMOTION_INTENTS = [
+    'do it','make this real','make it real','apply it','run it','execute','go live','promote'
+  ];
+
+  function isSandboxCommand(text) {
+    const s = normalizeCommandText(text);
+    return s === 'enter sandbox' || s === 'exit sandbox' || s === 'leave sandbox' || s === 'discard' || s === 'summarize'
+      || s === 'request promotion' || s === 'promote sandbox' || s === 'confirm promotion';
+  }
+
+  function enterSandbox() {
+    state.sandbox.active = true;
+    state.sandbox.entered_at = Date.now();
+    state.sandbox.notice_shown = false;
+    state.sandbox.promotion = { pending:false, brief:null };
+
+    sayAlice(
+      "Sandbox mode. I can explore ideas freely, but nothing here becomes action, observation, memory, or truth unless you explicitly promote it.\n\n" +
+      "If you want, say: “summarize”, “discard”, or “exit sandbox”."
+    );
+    state.sandbox.notice_shown = true;
+  }
+
+  function discardSandboxContent() {
+    if (!state.chat || !Array.isArray(state.chat.messages)) return;
+    state.chat.messages = state.chat.messages.filter(m => !m.sandbox);
+    persistChatToSession();
+  }
+
+  function exitSandbox(opts) {
+    const mode = (opts?.mode || 'normal'); // normal | promotion
+    const shouldDiscard = (mode === 'promotion') ? true : false;
+
+    if (shouldDiscard) discardSandboxContent();
+
+    state.sandbox.active = false;
+    state.sandbox.entered_at = null;
+    state.sandbox.notice_shown = false;
+    state.sandbox.promotion = { pending:false, brief:null };
+
+    if (mode === 'promotion') {
+      sayAlice("Okay. I’ve discarded the sandbox draft. Tell me what you want to do in normal mode (one clear sentence).");
+    } else {
+      sayAlice("Okay. Exiting sandbox.");
+    }
+  }
+
+  function requestPromotionCeremony() {
+    state.sandbox.promotion.pending = true;
+    state.sandbox.promotion.brief = null;
+
+    sayAlice(
+      "Promotion ceremony.\n\n" +
+      "1) I will discard the sandbox draft before we leave.\n" +
+      "2) You give me a short Promotion Brief (one sentence: what you want done).\n" +
+      "3) Then say “confirm promotion”.\n\n" +
+      "Reply with your Promotion Brief when ready."
+    );
+  }
+
+  function isImplicitPromotion(text) {
+    const s = normalizeCommandText(text);
+    if (!s) return false;
+    if (s === 'request promotion' || s === 'promote sandbox' || s === 'confirm promotion') return false;
+    return PROMOTION_INTENTS.includes(s);
+  }
+
+  function handleSandboxPromotionFlow(text) {
+    const s = normalizeCommandText(text);
+
+    // If promotion is already pending, do NOT restart the ceremony on repeats.
+    if (state.sandbox.promotion?.pending) {
+      // Re-issuing request promotion just reminds, it doesn't re-announce.
+      if (s === 'request promotion' || s === 'promote sandbox') {
+        const hasBrief = !!String(state.sandbox.promotion.brief || '').trim();
+        if (hasBrief) {
+          sayAlice('Promotion Brief captured. Say “confirm promotion” to proceed, or “discard” to cancel.');
+        } else {
+          sayAlice('I’m waiting for a one-sentence Promotion Brief. Reply with it, then say “confirm promotion”.');
+        }
+        return true;
+      }
+
+      // Confirm only after brief exists
+      if (s === 'confirm promotion') {
+        const brief = String(state.sandbox.promotion.brief || '').trim();
+        if (!brief) {
+          sayAlice('I still need a one-sentence Promotion Brief before I can confirm promotion.');
+          return true;
+        }
+        // Discard sandbox content and exit to normal mode
+        exitSandbox({ mode:'promotion' });
+        sayAlice(`Promotion Brief received:\n\n${brief}\n\nNow, in normal mode, repeat it (or refine it) and I’ll proceed under governed rules.`);
+        return true;
+      }
+
+      // Any non-command text becomes the brief
+      if (s && !isSandboxCommand(text)) {
+        state.sandbox.promotion.brief = String(text || '').trim();
+        sayAlice('Got it. If that’s your Promotion Brief, say “confirm promotion”. Or say “discard” to cancel.');
+        return true;
+      }
+
+      return false;
+    }
+
+    // Not pending: starting ceremony
+    if (s === 'request promotion' || s === 'promote sandbox') {
+      requestPromotionCeremony();
+      return true;
+    }
+
+    // Implicit promotion attempt is blocked in sandbox
+    if (isImplicitPromotion(text)) {
+      sayAlice(
+        "Sandbox boundary. I can’t promote or act on sandbox reasoning implicitly.\n\n" +
+        "Say “request promotion” to start a promotion ceremony, or “exit sandbox” to leave without promoting."
+      );
+      return true;
+    }
+
+    // Confirm without pending ceremony
+    if (s === 'confirm promotion') {
+      sayAlice('No promotion is pending. Say “request promotion” first.');
+      return true;
+    }
+
+    return false;
+  }
+
+
   // ---------- Command routing ----------
   async function handle(text) {
     const t = String(text || '').trim();
     const c = normalizeCommandText(t);
+
+    // Sandbox mode commands are handled before any other routing.
+    const sb = parseSandboxCommand(t);
+    if (sb) {
+      if (sb.kind === 'sandbox_on') { setSandboxEnabled(true); return; }
+      if (sb.kind === 'sandbox_off') { setSandboxEnabled(false); return; }
+      if (sb.kind === 'sandbox_discard') {
+        if (isSandboxEnabled()) {
+          // Discard = end sandbox + clear last assistant turn (best-effort, UI-local only)
+          setSandboxEnabled(false);
+          sayAlice("Discarded.");
+          return;
+        }
+      }
+      if (sb.kind === 'sandbox_summarize') {
+        if (isSandboxEnabled()) {
+          sayAlice("Tell me what you want summarized from our sandbox thread, and I’ll summarize it without promoting it to truth.");
+          return;
+        }
+      }
+    }
+
     if (state.pendingMemory) {
       const consumed = await handlePendingConfirmation(t);
       if (consumed) return;

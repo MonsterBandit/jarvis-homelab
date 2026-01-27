@@ -15,7 +15,7 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-async def run_tool(req: ToolRequest, enabled_tools: Optional[Set[str]] = None) -> ToolResult:
+async def run_tool(req: ToolRequest, enabled_tools: Optional[Set[str]] = None, governance_ctx: Optional[dict] = None) -> ToolResult:
     """
     Single, canonical tool execution entry point.
 
@@ -26,6 +26,20 @@ async def run_tool(req: ToolRequest, enabled_tools: Optional[Set[str]] = None) -
     """
     t0 = time.monotonic()
     started = _iso_now()
+
+    # Bundle 4 Phase 1: Sandbox boundary (mechanical guardrail)
+    # If a caller supplies governance_ctx={"sandbox": True}, fail-closed with structured boundary signal.
+    if governance_ctx and bool(governance_ctx.get("sandbox")):
+        return ToolResult(
+            ok=False,
+            tool_name=req.tool_name,
+            failure_class=ToolFailureClass.SANDBOX_BOUNDARY,
+            failure_message="Sandbox mode forbids tool execution.",
+            started_at=started,
+            ended_at=_iso_now(),
+            latency_ms=int((time.monotonic() - t0) * 1000),
+        )
+
 
     if not is_known_tool(req.tool_name):
         return ToolResult(

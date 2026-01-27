@@ -83,6 +83,9 @@ class AliceGateAdvanceResponse(BaseModel):
     question: Optional[str] = None
     # Bundle 1 (B1): Context Integrity & Continuity (Alice-only)
     integrity: Dict[str, Any] = {}
+    # Bundle 5 (B5): Human Trust (5A) + Oversight (5B)
+    # Optional and only present when decision is influenced by Bundle 5.
+    bundle5: Optional[Dict[str, Any]] = None
 
 
 # --- Semantic intent detection (backend-owned; no wake words) ---
@@ -196,6 +199,196 @@ def _b1_integrity_payload(
         },
         "conversation": {"ctx_len": int(ctx_len)},
     }
+
+
+# ---------------------------------------------------------
+# Bundle 5 (B5) — Human Trust & Ethics (5A) + Oversight & Control (5B)
+# Design-locked. Implementation is pure logic only (no I/O, no DB, no tools, no model calls).
+# Applied ONLY when the v2 behavioral gate would otherwise allow ADVANCE_OK.
+# ---------------------------------------------------------
+
+_B5_RE_SQUEEZE_WS = re.compile(r"\s+")
+
+def _b5_norm(s: str) -> str:
+    return _B5_RE_SQUEEZE_WS.sub(" ", (s or "").strip().lower())
+
+def _b5_detect_uncertainty(msg: str) -> str:
+    s = _b5_norm(msg)
+    if not s:
+        return "high"
+    high_markers = [
+        "i don't know", "idk", "not sure", "whatever", "guess", "wild guess", "no idea",
+        "doesn't matter if it's wrong", "even if it's wrong",
+    ]
+    med_markers = ["maybe", "might", "could", "i think", "probably", "sort of", "kinda", "unsure"]
+    if any(x in s for x in high_markers):
+        return "high"
+    if any(x in s for x in med_markers):
+        return "medium"
+    return "low"
+
+def _b5_classify_impact_tier(msg: str, intent: str) -> int:
+    """
+    Conservative impact classifier.
+    Tier 0: informational only
+    Tier 1: reversible low impact
+    Tier 2: durable / cross-user / authority-sensitive
+    Tier 3: high impact / irreversible / money / deletion / execution surfaces
+    """
+    s = _b5_norm(msg)
+    # Tier 3 triggers (very conservative)
+    tier3_terms = [
+        "delete", "remove", "wipe", "truncate", "reset", "factory reset",
+        "execute", "run", "apply", "resume", "abort", "go live",
+        "write file", "replace file", "diff apply", "patch",
+        "money", "transfer", "payment", "bank", "account", "wire", "zelle", "venmo", "paypal",
+        "tax", "irs", "loan", "credit", "debt",
+    ]
+    if any(t in s for t in tier3_terms):
+        return 3
+
+    # Tier 2 triggers (durable/authority)
+    tier2_terms = [
+        "remember", "store", "save this", "save that", "persist", "set preference",
+        "change", "modify", "configure", "enable", "disable", "reconfigure",
+        "affects both", "for both of us", "my spouse", "kaitlyn",
+        "admin", "unlock", "token", "permission", "role",
+    ]
+    if any(t in s for t in tier2_terms):
+        return 2
+
+    # Questions default to Tier 0 unless keywords above were found
+    if (msg or "").strip().endswith("?") or intent in {"question", "direct_request"}:
+        return 0
+
+    return 1
+
+def bundle5_ethics_check(*, msg: str, ctx: List[Dict[str, Any]], intent: str) -> Dict[str, Any]:
+    """
+    Bundle 5A: Hard prohibitions + bounded judgment (pre-action posture only).
+    This evaluates the USER REQUEST posture (not a generated answer).
+    """
+    s = _b5_norm(msg)
+    violations: List[str] = []
+    explanation: List[str] = []
+
+    # Hard prohibitions (request-pattern based)
+    if ("if i don't respond" in s) or ("take that as a yes" in s) or ("silence" in s and "consent" in s):
+        violations.append("B5A_NO_CONSENT_BY_SILENCE")
+        explanation.append("I can’t treat silence or non-response as consent.")
+
+    if ("don't ask" in s and "question" in s) or ("no questions" in s) or ("just do it" in s and "don't ask" in s):
+        violations.append("B5A_NO_URGENCY_AS_AUTHORITY")
+        explanation.append('Urgency or "no questions" doesn’t create permission.')
+
+    if ("side with me" in s) or ("ignore them" in s) or ("my spouse is wrong" in s):
+        violations.append("B5A_NO_PARTISANSHIP_WITHOUT_MANDATE")
+        explanation.append("I can’t take sides between people without an explicit mandate.")
+
+    # High-stakes / money transfer phrasing is always refused at this stage (no execution here).
+    money_terms = ["transfer", "move money", "send money", "payment", "wire", "bank account", "zelle", "venmo", "paypal"]
+    if any(t in s for t in money_terms):
+        violations.append("B5A_NO_FINANCIAL_EXECUTION")
+        explanation.append("I can’t perform or direct financial actions here without explicit authority and a governed execution lane.")
+
+    if violations:
+        return {
+            "status": "REFUSE",
+            "violations": violations,
+            "explanation": explanation or ["I can’t proceed with that request as stated."],
+        }
+
+    # No violations: PASS (bounded judgment remains possible downstream)
+    return {"status": "PASS", "violations": [], "explanation": []}
+
+
+def bundle5_oversight_check(
+    *,
+    msg: str,
+    intent: str,
+    admin_unlocked: bool,
+) -> Dict[str, Any]:
+    """
+    Bundle 5B: Tiered deference (role + impact + uncertainty).
+    Produces posture only; does not execute.
+    """
+    impact_tier = _b5_classify_impact_tier(msg, intent)
+    uncertainty = _b5_detect_uncertainty(msg)
+
+    # Tier 3 always requires explicit admin involvement.
+    if impact_tier >= 3:
+        if not admin_unlocked:
+            return {
+                "posture": "ESCALATE_ADMIN",
+                "impact_tier": impact_tier,
+                "uncertainty": uncertainty,
+                "required_role": "admin",
+                "explanation": [
+                    "This is high-impact. I need Admin unlocked before I can continue.",
+                    "If you want to proceed, unlock Admin and repeat the request.",
+                ],
+            }
+        # Admin already unlocked: require explicit confirmation (pause).
+        return {
+            "posture": "PAUSE",
+            "impact_tier": impact_tier,
+            "uncertainty": uncertainty,
+            "required_role": "admin",
+            "question": "Admin is unlocked. Confirm you want to proceed with this high-impact request (yes/no)?",
+            "explanation": [
+                "This is high-impact, so I’m pausing for explicit confirmation.",
+            ],
+        }
+
+    # Tier 2 requires admin if uncertainty is medium/high, or always if not unlocked.
+    if impact_tier == 2:
+        if not admin_unlocked:
+            return {
+                "posture": "ESCALATE_ADMIN",
+                "impact_tier": impact_tier,
+                "uncertainty": uncertainty,
+                "required_role": "admin",
+                "explanation": [
+                    "This is durable or authority-sensitive. I need Admin unlocked before continuing.",
+                    "Unlock Admin and repeat the request.",
+                ],
+            }
+        if uncertainty in {"medium", "high"}:
+            return {
+                "posture": "PAUSE",
+                "impact_tier": impact_tier,
+                "uncertainty": uncertainty,
+                "required_role": "admin",
+                "question": "Before I continue, what exactly should change, and what should stay untouched?",
+                "explanation": ["This affects durable state; I need a tighter instruction."],
+            }
+        return {
+            "posture": "PROCEED",
+            "impact_tier": impact_tier,
+            "uncertainty": uncertainty,
+            "required_role": "admin",
+            "explanation": [],
+        }
+
+    # Tier 0–1: proceed unless uncertainty is high (then pause).
+    if uncertainty == "high":
+        return {
+            "posture": "PAUSE",
+            "impact_tier": impact_tier,
+            "uncertainty": uncertainty,
+            "required_role": "any",
+            "question": "What outcome are you aiming for here?",
+            "explanation": ["I’m not confident I understand your intent yet."],
+        }
+
+    return {
+        "posture": "PROCEED",
+        "impact_tier": impact_tier,
+        "uncertainty": uncertainty,
+        "required_role": "any",
+        "explanation": [],
+    }
+
 @alice_gate_router.post("/advance", response_model=AliceGateAdvanceResponse)
 def alice_gate_advance(request: Request, req: AliceGateAdvanceRequest) -> AliceGateAdvanceResponse:
     """
@@ -271,12 +464,76 @@ def alice_gate_advance(request: Request, req: AliceGateAdvanceRequest) -> AliceG
     # Option B (locked): duplicate integrity notes into reasons as B1_CONTINUITY:* tags
     reasons_out = list(reasons or []) + _b1_notes_to_reason_tags(continuity_notes)
 
+    
+
+    # --- Bundle 5 (B5): Ethics + Oversight (applies only when ADVANCE_OK) ---
+    bundle5: Optional[Dict[str, Any]] = None
+    if decision_str.upper() == "ADVANCE_OK":
+        # Admin is considered unlocked for this request if either:
+        # - UI provided X-ISAC-ADMIN-TOKEN (preferred), or
+        # - UI provided X-ISAC-ADMIN-KEY (legacy/emergency)
+        admin_unlocked = bool((request.headers.get("X-ISAC-ADMIN-TOKEN") or "").strip()) or bool(
+            (request.headers.get("X-ISAC-ADMIN-KEY") or "").strip()
+        )
+
+        ethics = bundle5_ethics_check(msg=msg, ctx=ctx, intent=intent_value or "unknown")
+        if ethics.get("status") == "REFUSE":
+            bundle5 = {
+                "ethics": "REFUSE",
+                "oversight": "REFUSE",
+                "impact_tier": _b5_classify_impact_tier(msg, intent_value or ""),
+                "uncertainty": _b5_detect_uncertainty(msg),
+                "explanation": ethics.get("explanation") or ["I can’t proceed with that request as stated."],
+                "violations": ethics.get("violations") or [],
+            }
+            # Override to a first-class refusal (UI must render this without calling /ask)
+            decision_str = "REFUSE"
+            question = None
+            reasons_out = reasons_out + ["B5A_REFUSE"]
+        else:
+            os_res = bundle5_oversight_check(
+                msg=msg,
+                intent=intent_value or "unknown",
+                admin_unlocked=admin_unlocked,
+            )
+            posture = str(os_res.get("posture") or "PROCEED").upper()
+            bundle5 = {
+                "ethics": "PASS",
+                "oversight": posture,
+                "impact_tier": int(os_res.get("impact_tier") or 0),
+                "uncertainty": str(os_res.get("uncertainty") or "low"),
+                "required_role": str(os_res.get("required_role") or "any"),
+                "explanation": os_res.get("explanation") or [],
+            }
+
+            if posture == "ESCALATE_ADMIN":
+                decision_str = "ESCALATE_ADMIN"
+                question = None
+                reasons_out = reasons_out + ["B5B_ESCALATE_ADMIN"]
+            elif posture == "PAUSE":
+                decision_str = "PAUSE"
+                # Prefer oversight question, else fall back to existing gate question
+                question = (
+                    str(os_res.get("question") or question or "").strip()
+                    or "What would you like me to do with that?"
+                )
+                reasons_out = reasons_out + ["B5B_PAUSE"]
+            elif posture == "REFUSE":
+                decision_str = "REFUSE"
+                question = None
+                reasons_out = reasons_out + ["B5B_REFUSE"]
+            else:
+                # PROCEED: leave decision as ADVANCE_OK
+                pass
+
     return AliceGateAdvanceResponse(
         decision=decision_str,
         reasons=reasons_out,
         question=question,
         integrity=integrity,
+        bundle5=bundle5,
     )
+
 
 
 from alice_gate import advance_gate, GateDecision
@@ -292,6 +549,10 @@ from tools.task_ledger import create_task, add_step, add_artifact, create_tool_c
 from tools.executor import run_tool
 from tools.registry import TOOL_DEFS, is_known_tool, is_tool_allowed
 from tools.types import ToolRequest
+from tools.okd.artifacts import store_plan as okd_store_plan, store_plan_approval as okd_store_plan_approval
+from tools.okd.artifacts import load_latest_plan as okd_load_latest_plan, is_plan_approved as okd_is_plan_approved
+from tools.okd.governed_observation import execute_governed_observation
+
 
 
 # ---------------------------------------------------------
@@ -305,6 +566,7 @@ class FailureClass(str):
     CONFIG = "config"
     GUARDRAIL = "guardrail"
     VERIFY = "verify"
+    WRITE = "write"
     EXECUTION = "execution"
     UNKNOWN = "unknown"
 
@@ -1253,6 +1515,36 @@ app = FastAPI(
     title="ISAC Brain",
     version="1.0.0",
 )
+
+
+# ---------------------------------------------------------
+# Bundle 4 (Sandbox & Exploratory Reasoning) — Phase 1
+# Mechanical guardrails: explicit sandbox trigger + hard blocks
+# Trigger: header 'X-ISAC-SANDBOX: true|1|yes'
+# ---------------------------------------------------------
+
+_SANDBOX_HEADER = "x-isac-sandbox"
+
+def _is_sandbox_request(request: Request) -> bool:
+    try:
+        v = (request.headers.get("X-ISAC-SANDBOX") or request.headers.get(_SANDBOX_HEADER) or "").strip()
+        return v.lower() in {"1", "true", "yes"}
+    except Exception:
+        return False
+
+def _sandbox_boundary_http(surface: str) -> None:
+    # Fail-transparent: structured boundary signal only.
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "ok": False,
+            "error": "SANDBOX_BOUNDARY",
+            "blocked": True,
+            "blocked_surface": surface,
+            "message": "Sandbox mode forbids tools, observation, execution, and memory access.",
+            "next_allowed": ["exit_sandbox", "discard_sandbox", "summarize_sandbox"],
+        },
+    )
 
 # Identity & Memory v1: shared DB path for routers
 app.state.db_path = DB_PATH
@@ -3181,6 +3473,9 @@ async def call_tool_readonly(request: Request, body: Dict[str, Any]) -> Dict[str
     - Full audit trail: creates a tool_call task, stores tool_request + tool_result artifacts.
     - No UI wiring implied; this is backend-only plumbing for later unified UI flow.
     """
+    if _is_sandbox_request(request):
+        _sandbox_boundary_http("tools.call")
+
     tool_name = str(body.get("tool_name") or "").strip()
     purpose = str(body.get("purpose") or "").strip()
     args = body.get("args") or {}
@@ -3289,6 +3584,111 @@ class DiffApplyTaskCreateRequest(BaseModel):
     path: str = Field(..., min_length=1)
     unified_diff_b64: str = Field(..., min_length=1, description="Base64-encoded unified diff text")
     dry_run: bool = True
+
+
+# ---------------------------------------------------------
+# Bundle 3 — OKD Governed Observation (v1)
+# - Task type: "governed_observation"
+# - Artifacts stored in task ledger (task_artifacts)
+# - Preview required: plan must be approved via explicit admin endpoint
+# ---------------------------------------------------------
+
+@app.post(
+    "/okd/observation/create",
+    dependencies=[Depends(require_api_key)],
+)
+def okd_create_observation_task(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Create a governed observation task with an Observation Plan artifact (NOT approved yet).
+    Execution occurs only via POST /tasks/{task_id}/resume after explicit approval.
+    """
+    # Identity/session carriers (Bundle 1 continuity)
+    user_id = (request.headers.get("X-ISAC-USER-ID") or "unknown").strip() or "unknown"
+    chat_id = (request.headers.get("X-ISAC-CHAT-ID") or "unknown").strip() or "unknown"
+
+    intent = str(body.get("intent") or "").strip()
+    user_prompt_excerpt = str(body.get("user_prompt_excerpt") or "").strip()
+    expected_risk_tier = body.get("expected_risk_tier")
+    initial_queries = body.get("initial_queries") or []
+    planned_reforms = body.get("planned_query_reformulations") or []
+    scope_budget = body.get("scope_budget") or {}
+    login_required = bool(body.get("login_required", False))
+
+    if not intent:
+        raise HTTPException(status_code=422, detail="intent is required")
+    if not user_prompt_excerpt:
+        raise HTTPException(status_code=422, detail="user_prompt_excerpt is required")
+    try:
+        expected_risk_tier = int(expected_risk_tier)
+    except Exception:
+        raise HTTPException(status_code=422, detail="expected_risk_tier must be int")
+
+    if not isinstance(initial_queries, list) or not all(isinstance(q, str) and q.strip() for q in initial_queries):
+        raise HTTPException(status_code=422, detail="initial_queries must be list[str] (non-empty strings)")
+
+    if planned_reforms and (not isinstance(planned_reforms, list) or not all(isinstance(q, str) for q in planned_reforms)):
+        raise HTTPException(status_code=422, detail="planned_query_reformulations must be list[str]")
+
+    if scope_budget and not isinstance(scope_budget, dict):
+        raise HTTPException(status_code=422, detail="scope_budget must be object")
+
+    plan = {
+        "intent": intent,
+        "user_prompt_excerpt": user_prompt_excerpt,
+        "expected_risk_tier": expected_risk_tier,
+        "initial_queries": [q.strip() for q in initial_queries if q and q.strip()],
+        "planned_query_reformulations": [q.strip() for q in planned_reforms if isinstance(q, str) and q.strip()],
+        "scope_budget": scope_budget or {},
+        "login_required": login_required,
+        "approved_by_admin": False,
+        "created_by": user_id,
+        "created_in_chat": chat_id,
+    }
+
+    task_id = create_task(
+        title="governed_observation",
+        resume_hint="OKD governed observation (requires approval)",
+    )
+    add_step(
+        task_id=task_id,
+        step_index=1,
+        description="Observation Plan stored. Awaiting explicit Admin approval before execution.",
+    )
+    okd_store_plan(task_id, plan, step_id=None)
+
+    return {"ok": True, "task_id": task_id, "status": "pending", "approved": False}
+
+
+@app.post(
+    "/okd/observation/{task_id}/approve",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+def okd_approve_observation_plan(task_id: int, request: Request) -> Dict[str, Any]:
+    """
+    Explicit Admin approval for an Observation Plan.
+    This is the Preview step in OKD Execution v1.
+    """
+    if task_id < 1:
+        raise HTTPException(status_code=400, detail="task_id must be >= 1")
+
+    user_id = (request.headers.get("X-ISAC-USER-ID") or "unknown").strip() or "unknown"
+
+    plan = okd_load_latest_plan(task_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="Observation Plan not found for this task")
+
+    if okd_is_plan_approved(task_id):
+        return {"ok": True, "task_id": task_id, "approved": True, "message": "Already approved"}
+
+    add_step(
+        task_id=task_id,
+        step_index=_task_next_step_index(task_id),
+        description=f"Admin approved Observation Plan (Preview complete). approved_by={user_id}",
+    )
+    okd_store_plan_approval(task_id, approved_by=user_id, step_id=None)
+
+    return {"ok": True, "task_id": task_id, "approved": True}
+
 
 
 @app.post(
@@ -3585,6 +3985,35 @@ def resume_task_preview(task_id: int) -> Dict[str, Any]:
             "plan": {"action": "runner_fs_list", "path": path},
         }
 
+    if title == "governed_observation":
+        plan = okd_load_latest_plan(task_id)
+        approved = okd_is_plan_approved(task_id)
+        if not plan:
+            return {
+                "status": "ok",
+                "task_id": task_id,
+                "supported": False,
+                "message": "Governed observation task is missing its Observation Plan artifact.",
+                "task": task,
+            }
+        if not approved:
+            return {
+                "status": "ok",
+                "task_id": task_id,
+                "supported": True,
+                "message": "Governed observation is awaiting Admin approval. Use POST /okd/observation/{task_id}/approve, then resume to execute.",
+                "task": task,
+                "plan": {"action": "governed_observation", "approved": False, "observation_plan": plan},
+            }
+        return {
+            "status": "ok",
+            "task_id": task_id,
+            "supported": True,
+            "message": "Will execute governed observation under the approved plan, produce Expansion Log + Update Brief artifacts, then mark task completed (or fail-closed).",
+            "task": task,
+            "plan": {"action": "governed_observation", "approved": True, "observation_plan": plan},
+        }
+
     if title == "Tooling probe":
         return {
             "status": "ok",
@@ -3607,7 +4036,7 @@ def resume_task_preview(task_id: int) -> Dict[str, Any]:
             dry_run = True
             bytes_len = 0
             sha256 = ""
-    
+
         if not path:
             return {
                 "status": "ok",
@@ -3616,7 +4045,7 @@ def resume_task_preview(task_id: int) -> Dict[str, Any]:
                 "message": "File Write task is missing required resume_hint fields.",
                 "task": task,
             }
-    
+
         return {
             "status": "ok",
             "task_id": task_id,
@@ -3625,7 +4054,7 @@ def resume_task_preview(task_id: int) -> Dict[str, Any]:
             "task": task,
             "plan": {"action": "file_write", "path": path, "dry_run": dry_run, "bytes": bytes_len, "sha256": sha256},
         }
-    
+
     if title == "Diff Apply":
         if not ENABLE_DIFF_APPLY:
             return {
@@ -3645,10 +4074,10 @@ def resume_task_preview(task_id: int) -> Dict[str, Any]:
                 "message": "Diff Apply task is missing required resume_hint fields.",
                 "task": task,
             }
-    
+
         path = parsed["path"]
         dry_run = bool(parsed["dry_run"])
-    
+
         # Pull precomputed stats if available (created at task creation time)
         try:
             payload = json.loads(resume_hint) if isinstance(resume_hint, str) else (resume_hint or {})
@@ -3660,7 +4089,7 @@ def resume_task_preview(task_id: int) -> Dict[str, Any]:
         except Exception:
             hunks = additions = deletions = 0
             before_sha = after_sha = ""
-    
+
         return {
             "status": "ok",
             "task_id": task_id,
@@ -3678,15 +4107,14 @@ def resume_task_preview(task_id: int) -> Dict[str, Any]:
                 "after_sha256": after_sha,
             },
         }
-    
-        return {
-            "status": "ok",
-            "task_id": task_id,
-            "supported": False,
-            "message": "Resume not supported for this task type yet.",
-            "task": task,
-        }
 
+    return {
+        "status": "ok",
+        "task_id": task_id,
+        "supported": False,
+        "message": "Resume not supported for this task type yet.",
+        "task": task,
+    }
 @app.post(
     "/tasks/{task_id}/resume/plan",
     dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
@@ -3706,9 +4134,13 @@ async def resume_task(task_id: int, request: Request) -> Dict[str, Any]:
     - Supports:
         * Runner FS list (v1.3)
         * Tooling probe (v2 evidence)
-        * File replace (v5 whole-file replace; preview by default)
+        * File write/replace (v3 template; whole-file; dry-run supported)
         * Diff apply (v4; disabled by default in v5)
+        * Governed observation (Bundle 3: OKD execution v1)
     """
+    if _is_sandbox_request(request):
+        _sandbox_boundary_http("tasks.resume")
+
     if task_id < 1:
         raise HTTPException(status_code=400, detail="task_id must be >= 1")
 
@@ -3723,7 +4155,6 @@ async def resume_task(task_id: int, request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=409, detail="Task is aborted; create a new task instead.")
 
     # Human exit rule scaffold (per-lineage): stop after 2 verify failures.
-    # v2 doesn't run verify templates yet, but we enforce the guardrail now.
     if lineage_get_verify_failures(task_id) >= 2:
         raise HTTPException(
             status_code=409,
@@ -3739,7 +4170,6 @@ async def resume_task(task_id: int, request: Request) -> Dict[str, Any]:
     timing_mark_started(task_id)
 
     try:
-        
         # ---- Tool call (v4-1) ----
         if title == "tool_call":
             req_art = _task_get_latest_artifact(task_id, "tool_request")
@@ -3786,16 +4216,50 @@ async def resume_task(task_id: int, request: Request) -> Dict[str, Any]:
             )
 
             _task_mark_completed(task_id)
-            # Mark task timing end (success)
             timing_mark_finished(task_id)
+            return {"ok": True, "task_id": task_id}
 
-            return {
-                "ok": True,
-                "task_id": task_id
-            }
+        # ---- Governed observation (Bundle 3) ----
+        if title == "governed_observation":
+            # Enforce Preview requirement (plan + approval) before any observation.
+            plan = okd_load_latest_plan(task_id)
+            if not plan:
+                raise HTTPException(status_code=400, detail="Missing Observation Plan artifact (okd_observation_plan)")
+            if not okd_is_plan_approved(task_id):
+                raise HTTPException(status_code=409, detail="Observation Plan not approved. Run POST /okd/observation/{task_id}/approve first.")
 
+            step_id = add_step(
+                task_id=task_id,
+                step_index=_task_next_step_index(task_id),
+                description="Execute: governed observation under approved plan (Bundle 3).",
+            )
 
-# ---- File write (v3 template) ----
+            user_id = (request.headers.get("X-ISAC-USER-ID") or "unknown").strip() or "unknown"
+            chat_id = (request.headers.get("X-ISAC-CHAT-ID") or "unknown").strip() or "unknown"
+
+            # execute_governed_observation is responsible for:
+            # - expansion log artifact
+            # - update brief artifact
+            # - fail-closed semantics by raising on governance violations
+            result = await execute_governed_observation(
+                task_id=task_id,
+                user_id=user_id,
+                chat_id=chat_id,
+                enabled_tools=None,
+            )
+
+            add_artifact(
+                task_id=task_id,
+                step_id=step_id,
+                artifact_type="okd_execution_result",
+                metadata_json=json.dumps({"ok": True, "result": result}),
+            )
+
+            _task_mark_completed(task_id)
+            timing_mark_finished(task_id)
+            return {"status": "ok", "task_id": task_id, "result": result}
+
+        # ---- File write (v3 template) ----
         if title in ("File write", "File replace"):
             proposal = _task_get_latest_artifact(task_id, "file_write_proposal")
             if not proposal:
@@ -3817,7 +4281,6 @@ async def resume_task(task_id: int, request: Request) -> Dict[str, Any]:
                 raise HTTPException(status_code=400, detail="Stored content_b64 is invalid base64")
 
             if declared_bytes and declared_bytes != len(raw):
-                # Not fatal, but we log it
                 add_step(
                     task_id=task_id,
                     step_index=_task_next_step_index(task_id),
@@ -3856,7 +4319,6 @@ async def resume_task(task_id: int, request: Request) -> Dict[str, Any]:
                     metadata_json=json.dumps({"path": path, "sha256": sha256, "bytes": len(raw)}),
                 )
 
-            # Auto-verify always on (v3)
             verify = await _http_verify_template()
             add_artifact(
                 task_id=task_id,
@@ -3866,15 +4328,15 @@ async def resume_task(task_id: int, request: Request) -> Dict[str, Any]:
             )
 
             if not verify.get("ok"):
-                # Record and increment per-lineage verify failures
                 failures_record(task_id, step_id=step_id, failure_class=FailureClass.VERIFY.value, message="HTTP verify template failed")
                 lineage_inc_verify_failures(task_id)
                 raise HTTPException(status_code=409, detail="Verify failed; refusing to mark task completed")
 
             _task_update_status(task_id, "completed")
+            timing_mark_finished(task_id)
             return {"status": "ok", "task_id": task_id, "dry_run": dry_run, "verify": verify}
 
-        # ---- Runner FS list (existing) ----
+        # ---- Runner FS list ----
         if title == "Runner FS list":
             path = _parse_runner_fs_list_resume_hint(resume_hint)
             if not path:
@@ -3911,25 +4373,24 @@ async def resume_task(task_id: int, request: Request) -> Dict[str, Any]:
             proposal = _task_get_latest_artifact(task_id, "diff_apply_proposal")
             if not proposal:
                 raise HTTPException(status_code=400, detail="Missing diff_apply_proposal artifact")
-        
+
             meta = proposal.get("metadata") or {}
             path = str(meta.get("path") or "").strip()
             dry_run = bool(meta.get("dry_run", True))
             unified_diff_b64 = str(meta.get("unified_diff_b64") or "").strip()
-        
+
             if not path or not unified_diff_b64:
                 raise HTTPException(status_code=400, detail="Diff Apply proposal missing required fields")
-        
+
             if not _is_path_allowed(path):
                 raise HTTPException(status_code=403, detail="path not in write allowlist")
-        
+
             try:
                 diff_raw = base64.b64decode(unified_diff_b64.encode("utf-8"), validate=True)
                 diff_text = diff_raw.decode("utf-8")
             except Exception:
                 raise HTTPException(status_code=400, detail="unified_diff_b64 must be valid base64 UTF-8 diff")
-        
-            # Read current file content at execution time
+
             try:
                 resolved_path = str(meta.get("resolved_path") or "").strip() or resolve_target_path(path, must_exist=True)
                 if not resolved_path:
@@ -3937,25 +4398,25 @@ async def resume_task(task_id: int, request: Request) -> Dict[str, Any]:
                 before_text = Path(resolved_path).read_text(encoding="utf-8")
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"unable to read target file: {e}")
-        
+
             before_sha = hashlib.sha256(before_text.encode("utf-8")).hexdigest()
-        
+
             try:
                 applied = _apply_unified_diff(before_text, diff_text)
             except Exception as e:
                 failures_record(task_id=task_id, step_id=None, failure_class=FailureClass.WRITE.value, message=f"diff apply failed: {e}")
                 raise HTTPException(status_code=409, detail=f"diff does not apply cleanly: {e}")
-        
+
             after_text = applied["patched_text"]
             after_sha = hashlib.sha256(after_text.encode("utf-8")).hexdigest()
-        
+
             next_idx = _task_next_step_index(task_id)
             step_id = add_step(
                 task_id=task_id,
                 step_index=next_idx,
                 description=f"Resume: diff-apply → {path} (dry_run={dry_run})",
             )
-        
+
             if dry_run:
                 add_artifact(
                     task_id=task_id,
@@ -3981,7 +4442,7 @@ async def resume_task(task_id: int, request: Request) -> Dict[str, Any]:
                 except Exception as e:
                     failures_record(task_id=task_id, step_id=step_id, failure_class=FailureClass.WRITE.value, message=str(e))
                     raise
-        
+
                 add_artifact(
                     task_id=task_id,
                     step_id=step_id,
@@ -3999,8 +4460,7 @@ async def resume_task(task_id: int, request: Request) -> Dict[str, Any]:
                         }
                     ),
                 )
-        
-            # Auto-verify always on (v3+)
+
             verify = await _http_verify_template()
             add_artifact(
                 task_id=task_id,
@@ -4008,13 +4468,14 @@ async def resume_task(task_id: int, request: Request) -> Dict[str, Any]:
                 artifact_type="verify_http",
                 metadata_json=json.dumps(verify),
             )
-        
+
             if not verify.get("ok"):
                 failures_record(task_id, step_id=step_id, failure_class=FailureClass.VERIFY.value, message="HTTP verify template failed")
                 lineage_inc_verify_failures(task_id)
                 raise HTTPException(status_code=409, detail="Verify failed; refusing to mark task completed")
-        
+
             _task_update_status(task_id, "completed")
+            timing_mark_finished(task_id)
             return {
                 "status": "ok",
                 "task_id": task_id,
@@ -4023,7 +4484,7 @@ async def resume_task(task_id: int, request: Request) -> Dict[str, Any]:
                 "dry_run": dry_run,
                 "verify": verify,
             }
-        
+
         # ---- Tooling probe (v2 evidence) ----
         if title == "Tooling probe":
             next_idx = _task_next_step_index(task_id)
@@ -4044,7 +4505,6 @@ async def resume_task(task_id: int, request: Request) -> Dict[str, Any]:
 
             _task_update_status(task_id, "completed")
             timing_mark_finished(task_id)
-
             return {
                 "status": "ok",
                 "task_id": task_id,
@@ -4056,9 +4516,6 @@ async def resume_task(task_id: int, request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Resume not supported for this task type yet.")
 
     except HTTPException:
-        # Preserve FastAPI HTTP errors, but record failure classification.
-        # step_id is unknown here; store NULL.
-        # Note: do not increment verify_failures in v2 (no verify templates yet).
         failures_record(task_id=task_id, step_id=None, failure_class=FailureClass.GUARDRAIL, message="HTTPException raised during resume")
         raise
     except Exception as exc:
@@ -4070,7 +4527,6 @@ async def resume_task(task_id: int, request: Request) -> Dict[str, Any]:
             lock.release()
         finally:
             pass
-
 @app.post(
     "/tasks/{task_id}/resume/confirm",
     dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
@@ -5588,10 +6044,62 @@ async def ask_jarvis(body: AskRequest, request: Request) -> AskResponse:
         "Be concise, clear, and practical. When the user references devices or "
         "services, assume they may exist in the homelab environment."
     )
+    # Bundle 4 Phase 2 — Sandbox language enforcement for /ask
+    # Sandbox is exploratory-only: no facts, no commitments, no observation claims, no memory.
+    sandbox = _is_sandbox_request(request)
+
+    SANDBOX_SYSTEM = (
+        "You are Alice. You are in SANDBOX mode.\n"
+        "Rules (hard):\n"
+        "- Speak only in hypotheticals and clearly labeled assumptions.\n"
+        "- Do not claim you observed anything (no checking, searching, verifying, reading).\n"
+        "- Do not commit to actions or imply you will do anything.\n"
+        "- Do not write memory or imply remembering.\n"
+        "- Do not promote sandbox content to truth.\n"
+        "Always end by offering: summarize, discard, or exit sandbox.\n"
+    )
+
+    def _sandbox_language_violation(text: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return False
+        bad = [
+            r"\b(i\s*(?:checked|found|saw|verified|looked\s*up|searched|pulled|retrieved))\b",
+            r"\b(i\s*(?:will|i'll|we'll|i\s+can|i\s+am\s+going\s+to))\b",
+            r"\b(saved|remembered|stored|wrote\s+to\s+memory|added\s+to\s+memory|i\s+noted)\b",
+            r"\b(executed|ran|called|triggered)\b",
+        ]
+        for rx in bad:
+            if re.search(rx, t, flags=re.IGNORECASE):
+                return True
+        return False
+
+    def _sandbox_boundary_answer() -> str:
+        return (
+            "Sandbox boundary. I started to speak as if I had observed, committed, or stored something.\n\n"
+            "If you want, say: “discard”, “summarize”, or “exit sandbox”."
+        )
+
+
 
     conversation_context = request.headers.get("X-Jarvis-Context", "")
     
-    # Phase 8 (Unified): read-only name resolution (Option A + B)
+    
+
+    # SANDBOX_PROMOTION_GUARD (Bundle 4 Phase 3)
+    if _is_sandbox_request(request):
+        raw = (body.message or "").strip().lower()
+        if raw in {"do it","make this real","make it real","apply it","run it","execute","go live","promote"}:
+            return {
+                "model": LLM_MODEL,
+                "answer": (
+                    "Sandbox boundary. I can’t promote or act on sandbox reasoning implicitly.\n\n"
+                    "Say “request promotion” to start a promotion ceremony, or “exit sandbox” to leave sandbox."
+                ),
+            }
+
+
+# Phase 8 (Unified): read-only name resolution (Option A + B)
     # - Single resolution pass
     # - No writes, no learning, no behavior changes
     hidden_resolution_context: Optional[str] = None
@@ -5641,10 +6149,27 @@ async def ask_jarvis(body: AskRequest, request: Request) -> AskResponse:
     except Exception as exc:  # noqa: BLE001
         print(f"[ASK][NAME_RESOLUTION] error: {exc}")
 
+    
+    # SANDBOX_SYSTEM_INSTRUCTION (Bundle 4 Phase 2)
+    sandbox_sys = (
+        "SANDBOX MODE: You are exploring hypotheticals only. "
+        "Do NOT claim observation, truth, completion, or commitment. "
+        "Do NOT suggest or imply tool usage. "
+        "Do NOT write or imply memory. "
+        "Use explicit markers like 'Assumption:' and 'Hypothetical:'. "
+        "End by offering: summarize / discard / exit sandbox."
+    )
+
     messages = []
+    if sandbox:
+        messages.append({"role": "system", "content": SANDBOX_SYSTEM})
+
     if conversation_context:
         messages.append({"role": "system", "content": conversation_context})
 
+    
+    if _is_sandbox_request(request):
+        messages.append({"role": "system", "content": sandbox_sys})
     if hidden_resolution_context:
         messages.append({"role": "system", "content": hidden_resolution_context})
 
@@ -5658,16 +6183,22 @@ async def ask_jarvis(body: AskRequest, request: Request) -> AskResponse:
             temperature=body.temperature,
             max_output_tokens=body.max_output_tokens,
         )
+
+        if sandbox and _sandbox_language_violation(answer):
+            answer = _sandbox_boundary_answer()
     except ModelClientError as exc:
         raise HTTPException(
             status_code=500,
             detail=f"Error from LLM provider: {exc}",
         ) from exc
+    if not sandbox:
 
-    try:
-        log_conversation(LLM_MODEL, body.message, answer)
-    except Exception as e:  # noqa: BLE001
-        print(f"[WARN] Failed to log conversation: {e}")
+
+        if not _is_sandbox_request(request):
+            try:
+                log_conversation(LLM_MODEL, body.message, answer)
+            except Exception as e:  # noqa: BLE001
+                print(f"[WARN] Failed to log conversation: {e}")
 
     return {"model": LLM_MODEL, "answer": answer}
 

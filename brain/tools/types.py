@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 class ToolFailureClass(str, Enum):
     # Governance-aligned failure taxonomy (v4-4 compatible)
     TOOL_NOT_ALLOWED = "TOOL_NOT_ALLOWED"
+    SANDBOX_BOUNDARY = "SANDBOX_BOUNDARY"
     TOOL_TIMEOUT = "TOOL_TIMEOUT"
     TOOL_UPSTREAM_ERROR = "TOOL_UPSTREAM_ERROR"
     TOOL_BAD_INPUT = "TOOL_BAD_INPUT"

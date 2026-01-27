@@ -19,6 +19,33 @@ admin_memory_router = APIRouter(prefix="/memory", tags=["memory-admin"])
 admin_inbox_router = APIRouter(prefix="/admin", tags=["admin-inbox"])
 
 
+
+# ---------------------------------------------------------
+# Bundle 4 (Sandbox & Exploratory Reasoning) — Phase 1
+# Mechanical guardrails: explicit sandbox trigger + hard blocks
+# Trigger: header 'X-ISAC-SANDBOX: true|1|yes'
+# ---------------------------------------------------------
+
+def _is_sandbox_request(request: Request) -> bool:
+    try:
+        v = (request.headers.get("X-ISAC-SANDBOX") or request.headers.get("x-isac-sandbox") or "").strip()
+        return v.lower() in {"1", "true", "yes"}
+    except Exception:
+        return False
+
+def _sandbox_boundary_http(surface: str) -> None:
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "ok": False,
+            "error": "SANDBOX_BOUNDARY",
+            "blocked": True,
+            "blocked_surface": surface,
+            "message": "Sandbox mode forbids tools, observation, execution, and memory access.",
+            "next_allowed": ["exit_sandbox", "discard_sandbox", "summarize_sandbox"],
+        },
+    )
+
 class UserResolveResponse(BaseModel):
     user_id: str
     status: str
@@ -115,6 +142,9 @@ def show_memory(
     tier: Optional[int] = Query(default=None, description="Optional: 1 or 2"),
     x_isac_user_id: Optional[str] = Header(default=None, alias="X-ISAC-USER-ID"),
 ) -> Dict[str, Any]:
+    if _is_sandbox_request(request):
+        _sandbox_boundary_http("memory.show")
+
     user_id = _clean_user_id(x_isac_user_id)
     conn = _with_conn(request)
     try:
@@ -134,6 +164,9 @@ def write_memory_tier1(
     body: MemoryWriteRequest,
     x_isac_user_id: Optional[str] = Header(default=None, alias="X-ISAC-USER-ID"),
 ) -> MemoryWriteResponse:
+    if _is_sandbox_request(request):
+        _sandbox_boundary_http("memory.write")
+
     """Tier 1 write: safe self-profile, explicit confirmation is UI-mediated.
     Admin is NOT required for Tier 1.
     """
@@ -161,6 +194,9 @@ def forget_memory_tier1(
     body: MemoryDeleteRequest,
     x_isac_user_id: Optional[str] = Header(default=None, alias="X-ISAC-USER-ID"),
 ) -> Dict[str, Any]:
+    if _is_sandbox_request(request):
+        _sandbox_boundary_http("memory.forget")
+
     user_id = _clean_user_id(x_isac_user_id)
     key = (body.memory_key or "").strip()
     if not key:
@@ -203,6 +239,9 @@ class AdminMemoryWriteRequest(BaseModel):
 
 @admin_memory_router.post("/write", response_model=MemoryWriteResponse)
 def write_memory_admin(request: Request, body: AdminMemoryWriteRequest) -> MemoryWriteResponse:
+    if _is_sandbox_request(request):
+        _sandbox_boundary_http("memory.write_admin")
+
     uid = _clean_user_id(body.user_id)
     key = (body.memory_key or "").strip()
     val = (body.memory_value or "").strip()

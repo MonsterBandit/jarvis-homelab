@@ -36,9 +36,36 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from fastapi import APIRouter, Body, Header, HTTPException
+from fastapi import APIRouter, Body, Depends, Header, HTTPException
 
-router = APIRouter(prefix="/alice/memory", tags=["Alice Memory"])
+
+
+# ---------------------------------------------------------
+# Bundle 4 (Sandbox & Exploratory Reasoning) — Phase 1
+# Mechanical guardrails: explicit sandbox trigger + hard blocks
+# Trigger: header 'X-ISAC-SANDBOX: true|1|yes'
+# ---------------------------------------------------------
+
+def _is_sandbox_value(v: Optional[str]) -> bool:
+    try:
+        return bool(v and str(v).strip().lower() in {"1", "true", "yes"})
+    except Exception:
+        return False
+
+def _sandbox_guard(x_isac_sandbox: Optional[str] = Header(default=None, alias="X-ISAC-SANDBOX")) -> None:
+    if _is_sandbox_value(x_isac_sandbox):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "ok": False,
+                "error": "SANDBOX_BOUNDARY",
+                "blocked": True,
+                "blocked_surface": "alice.memory",
+                "message": "Sandbox mode forbids tools, observation, execution, and memory access.",
+                "next_allowed": ["exit_sandbox", "discard_sandbox", "summarize_sandbox"],
+            },
+        )
+router = APIRouter(prefix="/alice/memory", tags=["Alice Memory"], dependencies=[Depends(_sandbox_guard)])
 
 
 # ---------------------------------------------------------------------
