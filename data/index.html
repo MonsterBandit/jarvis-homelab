@@ -742,14 +742,20 @@
 
     toolsCall: '/tools/call',
 
-    // Identity & Memory v1
+    // Fix-It protocol
+    fixitAdvance: '/fixit/advance',
+    fixitConfirm: (caseId) => `/fixit/${caseId}/confirm`,
+    fixitExecute: (caseId) => `/fixit/${caseId}/execute`,    // Identity & Memory v1
     idMe: '/alice/identity/users/me',
     idResolve: '/alice/identity/users/resolve',
-    memShow: '/alice/memory/show',
-    memWrite: '/alice/memory/write',
-    memForget: '/alice/memory/forget',
     adminInbox: '/alice/admin/inbox',
 
+    // Memory (proposal-based)
+    memList: '/alice/memory',
+    memDelete: (id) => `/alice/memory/${id}`,
+    memProposals: '/alice/memory/proposals',
+    memProposalConfirm: (proposalId) => `/alice/memory/proposals/${proposalId}/confirm`,
+    memProposalReject: (proposalId) => `/alice/memory/proposals/${proposalId}/reject`,
     memoryCandidates: {
       concepts: [
         '/alice/memory/concepts',
@@ -779,6 +785,8 @@
     sandbox: { enabled: false, announced: false },
 
     presence: { mode: 'off' }, // 'off'|'breathing'|'ellipsis'
+
+    fixit: { active: false, caseId: null, lastProposals: [], awaiting: false, evidenceSeen: false },
 
 
     // ---------- Local read cursor (v4-B) ----------
@@ -887,7 +895,203 @@
     `;
   }
 
-  function sayAliceArtifact(label, preText, proseText, prov, showSources = true) {
+  
+  // ---------- Fix-It protocol (ACTIVE) ----------
+  function _fixitPersist() {
+    try { sessionStorage.setItem('fixit_state_v1', JSON.stringify({ active: !!state.fixit.active, caseId: state.fixit.caseId, awaiting: !!state.fixit.awaiting, evidenceSeen: !!state.fixit.evidenceSeen })); } catch {}
+  }
+  function _fixitRestore() {
+    try {
+      const raw = sessionStorage.getItem('fixit_state_v1');
+      if (!raw) return;
+      const obj = JSON.parse(raw);
+      if (!obj || typeof obj !== 'object') return;
+      state.fixit.active = !!obj.active;
+      state.fixit.caseId = (obj.caseId != null) ? Number(obj.caseId) : null;
+      state.fixit.awaiting = !!obj.awaiting;
+      state.fixit.evidenceSeen = !!obj.evidenceSeen;
+    } catch {}
+  }
+
+  function clearFixItState() {
+    state.fixit.active = false;
+    state.fixit.caseId = null;
+    state.fixit.lastProposals = [];
+    state.fixit.awaiting = false;
+    state.fixit.evidenceSeen = false;
+    try { sessionStorage.removeItem('fixit_state_v1'); } catch {}
+  }
+
+
+  function isFixItIntent(text) {
+    const raw = String(text || '').trim();
+    if (!raw) return false;
+
+    const s = raw.toLowerCase();
+
+    // Universal entry: explicit addressing is always accepted (but never required).
+    if (s.startsWith('alice, fix') || s.startsWith('alice fix')) return true;
+
+    // Canonical fix triggers.
+    if (s.startsWith('fix it') || s.startsWith('fix:') || s.startsWith('fix ')) return true;
+
+    // Bounded semantic triggers (v1): allow Fix-It without a wake word.
+    // Keep this deterministic and conservative to avoid accidental captures.
+    const starts = (p) => s.startsWith(p);
+    if (starts('change ') || starts('update ') || starts('edit ') || starts('correct ') || starts('replace ')) return true;
+
+    // Common transform phrasing: "from X to Y"
+    if (s.includes(' from ') && s.includes(' to ')) return true;
+
+    // UI-specific nudge: if the user mentions subtitle + a change verb, treat as Fix-It.
+    if (s.includes('subtitle') && (s.includes('change') || s.includes('update') || s.includes('fix') || s.includes('edit'))) return true;
+
+    return false;
+  }
+
+  function renderFixItProposalsCard(caseId, proposals) {
+    const cid = String(caseId || state.fixit.caseId || '');
+    const existing = document.getElementById('fixit_proposals_' + cid);
+    if (existing) existing.remove();
+
+    const items = (proposals || []).map(p => {
+      const h = esc(p.proposal_hash || '');
+      const title = esc(p.title || 'Proposal');
+      const summary = esc(p.summary || '');
+      const scope = esc(p.scope || '');
+      const risk = esc(p.risk || '');
+      const rollback = esc(p.rollback || '');
+      const verify = esc(p.verify || '');
+      return `
+        <div class="task" style="margin-top:10px;">
+          <div class="top">
+            <div>
+              <div class="name">${title}</div>
+              <div class="small">Hash: ${h.slice(0,12)}…</div>
+            </div>
+          </div>
+          <div class="small" style="margin-top:6px; white-space:pre-wrap;">
+${summary}
+          </div>
+          <div class="small" style="margin-top:8px;">
+            <strong>Scope:</strong> ${scope || '(unspecified)'}<br/>
+            <strong>Risk:</strong> ${risk || '(unspecified)'}<br/>
+            <strong>Rollback:</strong> ${rollback || '(unspecified)'}<br/>
+            <strong>Verify:</strong> ${verify || '(unspecified)'}
+          </div>
+          <div class="actions" style="margin-top:10px;">
+            <button class="btn" data-fixit="confirm" data-case="${esc(String(caseId))}" data-hash="${h}">Confirm</button>
+            <button class="btn primary" data-fixit="exec_dry" data-case="${esc(String(caseId))}" data-hash="${h}">Execute (dry-run)</button>
+            <button class="btn danger" data-fixit="exec_real" data-case="${esc(String(caseId))}" data-hash="${h}">Execute (real)</button>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    systemCard('PLAN · Fix-It proposals', `<div id="fixit_proposals_${cid}">
+      <div class="hint">Choose one proposal. “Confirm” records the decision. Execute is admin-gated and will run through the task spine.</div>
+      ${items || '<div class="empty">No proposals returned.</div>'}
+    </div>`);
+
+    // Bind actions
+    setTimeout(() => {
+      document.querySelectorAll('button[data-fixit]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const act = btn.getAttribute('data-fixit');
+          const cid = parseInt(btn.getAttribute('data-case') || '0', 10);
+          const hash = btn.getAttribute('data-hash') || '';
+          if (!cid || !hash) return;
+
+          if (!state.adminUnlocked) {
+            sayAlice('Admin is locked. Unlock admin to confirm or execute fixes.');
+            showUnlockCard();
+            return;
+          }
+
+          try {
+            if (act === 'confirm') {
+              await fetchJson(API.fixitConfirm(cid), { method:'POST', body: JSON.stringify({ proposal_hash: hash }) });
+              sayAlice('Confirmed. If you want, execute it now (dry-run or real).');
+              return;
+            }
+
+            const dryRun = (act === 'exec_dry') ? true : false;
+
+            // Confirm first (idempotent)
+            await fetchJson(API.fixitConfirm(cid), { method:'POST', body: JSON.stringify({ proposal_hash: hash }) });
+
+            // Execute
+            const res = await fetchJson(API.fixitExecute(cid), { method:'POST', body: JSON.stringify({ proposal_hash: hash, dry_run: dryRun }) });
+            systemCard('RESULT · Fix-It execution', `<pre>${esc(JSON.stringify(res, null, 2))}</pre>`);
+            toast(dryRun ? 'Executed (dry-run).' : 'Executed (real).');
+          } catch (e) {
+            systemCard('ERROR · Fix-It failed', `<pre>${esc(String(e.message || 'Unknown error').slice(0, 1600))}</pre>`);
+            toast(`Fix-It failed (${e.status || 'ERR'}).`);
+          }
+        });
+      });
+    }, 0);
+  }
+
+  async function fixitAdvance(userText) {
+    const payload = {
+      message: String(userText || '').trim(),
+      case_id: state.fixit.caseId || null,
+      // domain left null intentionally; backend defaults to 'ops' on case create.
+      scope: null,
+    };
+
+    const res = await fetchJson(API.fixitAdvance, { method:'POST', body: JSON.stringify(payload) });
+
+    // If backend returns a case_id, we are now in an active Fix-It case.
+    if (res?.case_id) {
+      state.fixit.caseId = res.case_id;
+      state.fixit.active = true;
+      _fixitPersist();
+    }
+
+    // Heuristic completion/abort flags (fail-safe): if backend explicitly signals completion, clear local Fix-It state.
+    const status = String(res?.status || '').toLowerCase().trim();
+    if (res?.done === true || res?.completed === true || res?.aborted === true || ['done','closed','complete','completed','aborted'].includes(status)) {
+      clearFixItState();
+    }
+
+    if (res?.one_question) {
+      // We are awaiting a user clarification; route the next user message back into /fixit/advance.
+      state.fixit.awaiting = true;
+      _fixitPersist();
+      sayAlice(stripSpeakerPrefix(String(res.one_question)));
+      return;
+    }
+
+    if (res?.evidence_summary) {
+      state.fixit.evidenceSeen = true;
+      _fixitPersist();
+      sayAlice(`# Evidence\n${String(res.evidence_summary).trim()}`);
+    }
+
+    const proposals = Array.isArray(res?.proposals) ? res.proposals : [];
+    state.fixit.lastProposals = proposals;
+
+    if (proposals.length) {
+      state.fixit.awaiting = false;
+      _fixitPersist();
+      renderFixItProposalsCard(res.case_id || state.fixit.caseId, proposals);
+      return;
+    }
+
+    if (res?.notes) {
+      state.fixit.awaiting = false;
+      _fixitPersist();
+      sayAlice(String(res.notes));
+      return;
+    }
+
+    // If nothing to do, remain present.
+    showPresence('ellipsis');
+  }
+
+function sayAliceArtifact(label, preText, proseText, prov, showSources = true) {
     // Presence must disappear the instant Alice begins speaking.
     removePresence();
 
@@ -1524,9 +1728,16 @@
       } catch {}
     }
 
+    // Admin token is session-only. Persist across reloads via sessionStorage (still not stored long-term).
     state.adminToken = null;
     state.adminUnlocked = false;
-    try { sessionStorage.removeItem('isac_admin_token'); } catch {}
+    try {
+      const tok = sessionStorage.getItem('isac_admin_token');
+      if (tok && String(tok).trim()) {
+        state.adminToken = String(tok).trim();
+        state.adminUnlocked = true;
+      }
+    } catch {}
     setAdminUI();
 
     if (!state.apiKey) {
@@ -1986,26 +2197,67 @@ async function idMe() {
   return data;
 }
 
-async function memV1Show() {
-  const data = await fetchJson(API.memShow, { method:'GET' });
-  return data;
+async function memV1List() {
+  // Canonical list endpoint (read-only)
+  return await fetchJson(API.memList, { method:'GET' });
 }
 
-async function memV1Write(key, value) {
+function _memNormalizeKey(k) {
+  return String(k || '').trim().toLowerCase();
+}
+
+function _memExtractItems(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.items)) return payload.items;
+  if (Array.isArray(payload?.memories)) return payload.memories;
+  if (Array.isArray(payload?.memory)) return payload.memory;
+  if (Array.isArray(payload?.data)) return payload.data;
+  return [];
+}
+
+function _memExtractId(item) {
+  if (!item || typeof item !== 'object') return null;
+  const id = item.id ?? item.memory_id ?? item.mem_id ?? item.pk;
+  return (id == null) ? null : String(id);
+}
+
+function _memExtractKey(item) {
+  if (!item || typeof item !== 'object') return '';
+  return String(item.memory_key ?? item.key ?? item.name ?? '').trim();
+}
+
+async function memV1WriteViaProposal(key, value) {
+  if (!state.adminUnlocked) throw new Error('Admin is locked');
   const body = { memory_key: String(key || '').trim(), memory_value: String(value || '').trim() };
   if (!body.memory_key || !body.memory_value) throw new Error('memory_key and memory_value required');
-  return await fetchJson(API.memWrite, { method:'POST', body: JSON.stringify(body) });
+
+  const prop = await fetchJson(API.memProposals, { method:'POST', body: JSON.stringify(body) });
+  const proposalId = prop?.proposal_id ?? prop?.id ?? prop?.proposal?.id;
+  if (proposalId == null) throw new Error('Proposal created but no proposal_id returned');
+
+  return await fetchJson(API.memProposalConfirm(String(proposalId)), { method:'POST', body: '{}' });
 }
 
-async function memV1Forget(key) {
-  const body = { memory_key: String(key || '').trim() };
-  if (!body.memory_key) throw new Error('memory_key required');
-  return await fetchJson(API.memForget, { method:'POST', body: JSON.stringify(body) });
+async function memV1ForgetByKey(key) {
+  if (!state.adminUnlocked) throw new Error('Admin is locked');
+  const want = _memNormalizeKey(key);
+  if (!want) throw new Error('memory_key required');
+
+  const payload = await memV1List();
+  const items = _memExtractItems(payload);
+  const hit = items.find(it => _memNormalizeKey(_memExtractKey(it)) === want);
+  if (!hit) return { ok: true, already_forgotten: true };
+
+  const id = _memExtractId(hit);
+  if (!id) throw new Error('Matched memory entry but missing id');
+
+  return await fetchJson(API.memDelete(id), { method:'DELETE' });
 }
 
 async function adminInboxList() {
   return await fetchJson(API.adminInbox, { method:'GET' });
 }
+
 
 function isAffirmation(text) {
     const t = String(text || '').trim().toLowerCase();
@@ -2075,10 +2327,10 @@ Reply “yes” to confirm, or “no” to cancel.`);
         sayAlice('Removed.');
       } else if (kind === 'memv1_write') {
         const val = String(value || '').trim();
-        await memV1Write(key, val);
+        await memV1WriteViaProposal(key, val);
         sayAlice('Saved to your profile.');
       } else if (kind === 'memv1_forget') {
-        await memV1Forget(key);
+        await memV1ForgetByKey(key);
         sayAlice('Forgotten.');
       } else {
 
@@ -2409,7 +2661,7 @@ Reply “yes” to confirm, or “no” to cancel.`);
 
     if (c === 'show my memory' || c === 'show me my memory' || c === 'show memory' || c === 'show me memory' || c === 'memories') {
       try {
-        const data = await memV1Show();
+        const data = await memV1List();
         systemCard('RESULT · Memory (v1)', `<pre>${esc(JSON.stringify(data, null, 2))}</pre>`);
       } catch (e) {
         sayAlice(`I couldn’t read your memory (${e.status || 'ERR'}).`);
@@ -2435,7 +2687,7 @@ Reply “yes” to confirm, or “no” to cancel.`);
     if (memCmd) {
       if (memCmd.kind === 'mem_show') {
         try {
-          const data = await memV1Show();
+          const data = await memV1List();
           systemCard('RESULT · Memory (v1)', `<pre>${esc(JSON.stringify(data, null, 2))}</pre>`);
         } catch (e) {
           sayAlice(`I couldn’t read your memory (${e.status || 'ERR'}).`);
@@ -2444,7 +2696,7 @@ Reply “yes” to confirm, or “no” to cancel.`);
       }
       if (memCmd.kind === 'whoami') {
         try {
-          const data = await identityWhoAmI();
+          const data = await idMe();
           systemCard('RESULT · Identity (v1)', `<pre>${esc(JSON.stringify(data, null, 2))}</pre>`);
         } catch (e) {
           sayAlice(`I couldn’t read your identity (${e.status || 'ERR'}).`);
@@ -2469,54 +2721,6 @@ Reply “yes” to confirm, or “no” to cancel.`);
       }
     }
 
-// v1 profile memory command: "remember key=value"
-    const rem = t.match(/^remember\s+([^=:\n]+)\s*[:=]\s*(.+)$/i);
-    if (rem) {
-      const key = normalizeConceptKey(rem[1]);
-      const val = String(rem[2] || '').trim();
-      if (!key || !val) { sayAlice('Use `remember key=value` (or `remember <key> is <value>`).'); return; }
-      setPending('memv1_write', key, val);
-      toast('Pending save. Reply “yes” to confirm.');
-      return;
-    }
-
-    // v1 profile memory command: natural language "remember KEY is VALUE"
-    // Examples:
-    //   remember my favorite color is blue
-    //   remember that my favorite color is blue
-    const rem2 = t.match(/^remember\s+(?:that\s+)?(.+?)\s+is\s+(.+)$/i);
-    if (rem2) {
-      const key = normalizeConceptKey(rem2[1]);
-      const val = String(rem2[2] || '').trim();
-      if (!key || !val) { sayAlice('Use `remember key=value` (or `remember <key> is <value>`).'); return; }
-      setPending('memv1_write', key, val);
-      toast('Pending save. Reply “yes” to confirm.');
-      return;
-    }
-
-    // v1 profile memory command: minimal fallback "remember KEY VALUE"
-    // (Only if KEY is multi-word to avoid accidental captures.)
-    const rem3 = t.match(/^remember\s+(.+?)\s+([^\s]+)$/i);
-    if (rem3) {
-      const keyRaw = String(rem3[1] || '').trim();
-      const val = String(rem3[2] || '').trim();
-      if (keyRaw && keyRaw.includes(' ') && val) {
-        const key = normalizeConceptKey(keyRaw);
-        setPending('memv1_write', key, val);
-        toast('Pending save. Reply “yes” to confirm.');
-        return;
-      }
-    }
-
-    // v1 profile forget: "forget key"
-    const fkv1 = t.match(/^forget\s+(.+)$/i);
-    if (fkv1) {
-      const key = normalizeConceptKey(fkv1[1]);
-      if (!key) { toast('Forget what? Provide a key.'); return; }
-      setPending('memv1_forget', key);
-      toast('Pending forget. Reply “yes” to confirm.');
-      return;
-    }
 
     if (c === 'unlock admin' || c === 'unlock') { showUnlockCard(); return; }
     if (c === 'lock admin' || c === 'lock') { lockAdmin(); return; }
@@ -2549,6 +2753,13 @@ Reply “yes” to confirm, or “no” to cancel.`);
       return;
     }
 
+    // Fix-It user cancel/abort (client-side only; does not execute anything)
+    if (c === 'cancel fix' || c === 'abort fix' || c === 'exit fix' || c === 'stop fix') {
+      clearFixItState();
+      sayAlice('Okay.');
+      return;
+    }
+
     // Tool command routing (v4-A unified tool-call flow)
     const cmd = parseToolCommand(t);
     if (cmd) {
@@ -2561,6 +2772,33 @@ Reply “yes” to confirm, or “no” to cancel.`);
         systemCard('ERROR · Tool call failed', `<pre>${esc(String(e.message || 'Unknown error').slice(0, 1200))}</pre>`);
         setHealth(false);
       }
+      return;
+    }
+
+    // Fix-It continuation:
+    // If we are in an active Fix-It case and Alice is awaiting clarification,
+    // route the next plain user message back into /fixit/advance even if it doesn't start with "fix".
+    if (state.fixit.active && state.fixit.caseId && state.fixit.awaiting && !isFixItIntent(t)) {
+      await fixitAdvance(t);
+      return;
+    }
+
+    // Fix-It conversational advance:
+    // If evidence has been surfaced for the active case, treat short affirmations as "advance to proposal".
+    // This keeps the flow conversational (no wake word, no special command required).
+    const _isShortAffirm = (txt) => {
+      const s = normalizeCommandText(txt);
+      return ['yes','y','yep','yeah','ok','okay','sure','sounds good','go ahead','do it','proceed','continue','next'].includes(s);
+    };
+    if (state.fixit.active && state.fixit.caseId && state.fixit.evidenceSeen && !state.fixit.awaiting && _isShortAffirm(t) && !isFixItIntent(t)) {
+      await fixitAdvance(t);
+      return;
+    }
+
+
+    // Fix-It routing (must precede /advance)
+    if (isFixItIntent(t)) {
+      await fixitAdvance(t);
       return;
     }
 
@@ -2608,6 +2846,8 @@ Reply “yes” to confirm, or “no” to cancel.`);
 
     loadChatFromSession();
     renderTranscriptFromState();
+
+    _fixitRestore();
 
     if ((state.chat?.messages || []).length === 0) {
       systemNote('Ready.');

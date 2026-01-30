@@ -1,293 +1,390 @@
 from __future__ import annotations
 
-import json
+"""
+identity_memory/router.py
+
+Identity & Memory v1 — minimal API surface (LOCK-READY).
+
+LAP defaults:
+- Identity & Memory is INACTIVE unless explicitly activated later.
+- All endpoints below are present for structure + guard verification, but fail-closed in LAP.
+- No background jobs are scheduled.
+"""
+
+import os
+import sqlite3
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request
 
 from . import db as idb
 
 
-# Public routers (read-gated by main.py include_router dependencies)
-identity_router = APIRouter(prefix="/identity", tags=["identity"])
-memory_router = APIRouter(prefix="/memory", tags=["memory"])
-
-# Admin routers (admin-gated by main.py include_router dependencies)
-admin_identity_router = APIRouter(prefix="/identity", tags=["identity-admin"])
-admin_memory_router = APIRouter(prefix="/memory", tags=["memory-admin"])
-admin_inbox_router = APIRouter(prefix="/admin", tags=["admin-inbox"])
+def _db_path_from_request(request: Request) -> str:
+    # main.py sets app.state.db_path = DB_PATH; fall back to env or default.
+    p = getattr(getattr(request, "app", None), "state", None)
+    candidate = getattr(p, "db_path", None) if p else None
+    return str(candidate or os.getenv("JARVIS_DB_PATH") or os.getenv("JARVIS_BRAIN_DB_PATH") or "/app/data/jarvis_brain.db")
 
 
+# ----------------------------
+# LAP guard (fail-closed)
+# ----------------------------
 
-# ---------------------------------------------------------
-# Bundle 4 (Sandbox & Exploratory Reasoning) — Phase 1
-# Mechanical guardrails: explicit sandbox trigger + hard blocks
-# Trigger: header 'X-ISAC-SANDBOX: true|1|yes'
-# ---------------------------------------------------------
+def _is_truthy(v: Optional[str]) -> bool:
+    return bool(v and str(v).strip().lower() in {"1", "true", "yes", "on"})
 
-def _is_sandbox_request(request: Request) -> bool:
-    try:
-        v = (request.headers.get("X-ISAC-SANDBOX") or request.headers.get("x-isac-sandbox") or "").strip()
-        return v.lower() in {"1", "true", "yes"}
-    except Exception:
-        return False
-
-def _sandbox_boundary_http(surface: str) -> None:
-    raise HTTPException(
-        status_code=403,
-        detail={
-            "ok": False,
-            "error": "SANDBOX_BOUNDARY",
-            "blocked": True,
-            "blocked_surface": surface,
-            "message": "Sandbox mode forbids tools, observation, execution, and memory access.",
-            "next_allowed": ["exit_sandbox", "discard_sandbox", "summarize_sandbox"],
-        },
-    )
-
-class UserResolveResponse(BaseModel):
-    user_id: str
-    status: str
-    created: bool
-    expires_at: Optional[str] = None
-    last_seen_at: str
-
-
-class MemoryWriteRequest(BaseModel):
-    memory_key: str = Field(..., min_length=1, max_length=200)
-    memory_value: str = Field(..., min_length=1, max_length=4000)
-
-
-class MemoryWriteResponse(BaseModel):
-    id: int
-    action: str
-    memory_key: str
-    memory_value: str
-    tier: int
-
-
-class MemoryDeleteRequest(BaseModel):
-    memory_key: str = Field(..., min_length=1, max_length=200)
-
-
-def _clean_user_id(v: Optional[str]) -> str:
-    u = (v or "").strip()
-    if not u:
-        raise HTTPException(status_code=400, detail="X-ISAC-USER-ID required")
-    if len(u) > 80:
-        raise HTTPException(status_code=400, detail="user_id too long")
-    return u
-
-
-def _db_path_from_env(request: Request) -> str:
-    # main.py uses DB_PATH env var; we read the same from app state when set by main.py
-    p = getattr(request.app.state, "db_path", None)
-    if not p:
-        # Fallback: if state not set, use the same default main.py uses.
-        p = "/app/data/jarvis_brain.db"
-    return str(p)
-
-
-def _with_conn(request: Request):
-    db_path = _db_path_from_env(request)
-    conn = idb.connect(db_path)
-    return conn
-
-
-@identity_router.post("/users/resolve", response_model=UserResolveResponse)
-def resolve_user(
-    request: Request,
-    x_isac_user_id: Optional[str] = Header(default=None, alias="X-ISAC-USER-ID"),
-) -> UserResolveResponse:
-    user_id = _clean_user_id(x_isac_user_id)
-    conn = _with_conn(request)
-    try:
-        idb.opportunistic_sweep(conn)
-        u = idb.ensure_user(conn, user_id)
-        idb.reinforce_user(conn, user_id)  # reinforcement on activity (extends expiry)
-        conn.commit()
-        return UserResolveResponse(
-            user_id=u["user_id"],
-            status=u["status"],
-            created=bool(u.get("created")),
-            expires_at=u.get("expires_at"),
-            last_seen_at=u["last_seen_at"],
+def _require_identity_memory_active() -> None:
+    # Default: inactive unless explicitly enabled later.
+    if not _is_truthy(os.getenv("ISAC_IDENTITY_MEMORY_ACTIVE")):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "ok": False,
+                "error": "IDENTITY_MEMORY_INACTIVE",
+                "blocked": True,
+                "phase": "LAP",
+                "message": "Identity & Memory is not active during the Last Administrative Phase (LAP).",
+                "next_allowed": ["continue_lap_implementation", "activate_identity_memory_later_with_admin"],
+            },
         )
-    finally:
-        conn.close()
 
 
-@identity_router.get("/users/me")
-def me(
+# Routers (names used by main.py includes)
+identity_router = APIRouter(prefix="/identity", tags=["identity"])
+admin_identity_router = APIRouter(prefix="/identity", tags=["identity-admin"])
+
+memory_router = APIRouter(prefix="/memory", tags=["memory"])
+admin_memory_router = APIRouter(prefix="/memory", tags=["memory-admin"])
+
+admin_inbox_router = APIRouter(prefix="/admin", tags=["admin-inbox"])
+audit_router = APIRouter(prefix="/audit", tags=["audit"])
+
+
+# ----------------------------
+# Identity APIs
+# ----------------------------
+
+@identity_router.get("/me")
+def identity_me(
     request: Request,
-    x_isac_user_id: Optional[str] = Header(default=None, alias="X-ISAC-USER-ID"),
+    x_alice_session_id: Optional[str] = Header(default=None, alias="X-ALICE-SESSION-ID"),
 ) -> Dict[str, Any]:
-    user_id = _clean_user_id(x_isac_user_id)
-    conn = _with_conn(request)
+    _require_identity_memory_active()
+
+    sid = (x_alice_session_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="X-ALICE-SESSION-ID header is required")
+
+    db_path = _db_path_from_request(request)
+    conn = idb.connect(db_path)
     try:
-        idb.opportunistic_sweep(conn)
-        idb.ensure_user(conn, user_id)
-        idb.reinforce_user(conn, user_id)
-        u = idb.get_user(conn, user_id)
+        user = idb.resolve_or_create_user_for_session(conn, session_id=sid)
         conn.commit()
-        return {"status": "ok", "user": u}
+        return {
+            "user_id": user["user_id"],
+            "lifecycle_state": user["lifecycle_state"],
+            "expiry_at": user.get("expiry_at"),
+            "reinforced_at": user.get("reinforced_at"),
+            "created": bool(user.get("created")),
+        }
     finally:
         conn.close()
 
 
-@memory_router.get("/show")
-def show_memory(
+@admin_identity_router.get("/users/{user_id}")
+def get_user_admin(
     request: Request,
-    tier: Optional[int] = Query(default=None, description="Optional: 1 or 2"),
-    x_isac_user_id: Optional[str] = Header(default=None, alias="X-ISAC-USER-ID"),
+    user_id: int,
 ) -> Dict[str, Any]:
-    if _is_sandbox_request(request):
-        _sandbox_boundary_http("memory.show")
+    _require_identity_memory_active()
 
-    user_id = _clean_user_id(x_isac_user_id)
-    conn = _with_conn(request)
+    conn = idb.connect(_db_path_from_request(request))
     try:
-        idb.opportunistic_sweep(conn)
-        idb.ensure_user(conn, user_id)
-        idb.reinforce_user(conn, user_id)
-        items = idb.list_memory(conn, user_id, tier=tier)
-        conn.commit()
-        return {"status": "ok", "user_id": user_id, "count": len(items), "items": items}
+        u = idb.get_user_admin(conn, int(user_id))
+        if not u:
+            raise HTTPException(status_code=404, detail="User not found")
+        return u
     finally:
         conn.close()
 
-
-@memory_router.post("/write", response_model=MemoryWriteResponse)
-def write_memory_tier1(
-    request: Request,
-    body: MemoryWriteRequest,
-    x_isac_user_id: Optional[str] = Header(default=None, alias="X-ISAC-USER-ID"),
-) -> MemoryWriteResponse:
-    if _is_sandbox_request(request):
-        _sandbox_boundary_http("memory.write")
-
-    """Tier 1 write: safe self-profile, explicit confirmation is UI-mediated.
-    Admin is NOT required for Tier 1.
-    """
-    user_id = _clean_user_id(x_isac_user_id)
-    key = (body.memory_key or "").strip()
-    val = (body.memory_value or "").strip()
-    if not key or not val:
-        raise HTTPException(status_code=400, detail="memory_key and memory_value required")
-
-    conn = _with_conn(request)
-    try:
-        idb.opportunistic_sweep(conn)
-        idb.ensure_user(conn, user_id)
-        idb.reinforce_user(conn, user_id)
-        r = idb.upsert_memory(conn, user_id, key, val, tier=1, actor="user")
-        conn.commit()
-        return MemoryWriteResponse(**r)
-    finally:
-        conn.close()
-
-
-@memory_router.post("/forget")
-def forget_memory_tier1(
-    request: Request,
-    body: MemoryDeleteRequest,
-    x_isac_user_id: Optional[str] = Header(default=None, alias="X-ISAC-USER-ID"),
-) -> Dict[str, Any]:
-    if _is_sandbox_request(request):
-        _sandbox_boundary_http("memory.forget")
-
-    user_id = _clean_user_id(x_isac_user_id)
-    key = (body.memory_key or "").strip()
-    if not key:
-        raise HTTPException(status_code=400, detail="memory_key required")
-
-    conn = _with_conn(request)
-    try:
-        idb.opportunistic_sweep(conn)
-        idb.ensure_user(conn, user_id)
-        idb.reinforce_user(conn, user_id)
-        r = idb.delete_memory(conn, user_id, key, actor="user")
-        conn.commit()
-        return {"status": "ok", **r}
-    finally:
-        conn.close()
-
-
-# ---------------- Admin endpoints ----------------
 
 @admin_identity_router.post("/users/{user_id}/promote")
-def promote_user_admin(request: Request, user_id: str) -> Dict[str, Any]:
-    uid = _clean_user_id(user_id)
-    conn = _with_conn(request)
+def promote_user(
+    request: Request,
+    user_id: int,
+) -> Dict[str, Any]:
+    _require_identity_memory_active()
+
+    conn = idb.connect(_db_path_from_request(request))
     try:
-        idb.opportunistic_sweep(conn)
-        idb.ensure_user(conn, uid)
-        idb.promote_user(conn, uid)
+        idb.promote_user_to_permanent(conn, int(user_id))
         conn.commit()
-        return {"status": "ok", "user_id": uid, "promoted": True}
+        return {"ok": True, "user_id": int(user_id), "lifecycle_state": "permanent"}
     finally:
         conn.close()
 
 
-class AdminMemoryWriteRequest(BaseModel):
-    user_id: str = Field(..., min_length=1, max_length=80)
-    memory_key: str = Field(..., min_length=1, max_length=200)
-    memory_value: str = Field(..., min_length=1, max_length=4000)
-    memory_tier: int = Field(..., ge=2, le=2)
+# ----------------------------
+# Memory APIs
+# ----------------------------
 
+@memory_router.get("")
+def list_memory(
+    request: Request,
+    tier: Optional[int] = Query(default=None),
+    # user_id is admin-only in the locked API. Enforced by routing: only admin router accepts it.
+) -> Dict[str, Any]:
+    _require_identity_memory_active()
 
-@admin_memory_router.post("/write", response_model=MemoryWriteResponse)
-def write_memory_admin(request: Request, body: AdminMemoryWriteRequest) -> MemoryWriteResponse:
-    if _is_sandbox_request(request):
-        _sandbox_boundary_http("memory.write_admin")
+    # Normal user view: derive user from session id.
+    sid = (request.headers.get("X-ALICE-SESSION-ID") or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="X-ALICE-SESSION-ID header is required")
 
-    uid = _clean_user_id(body.user_id)
-    key = (body.memory_key or "").strip()
-    val = (body.memory_value or "").strip()
-    if not key or not val:
-        raise HTTPException(status_code=400, detail="memory_key and memory_value required")
-
-    conn = _with_conn(request)
+    conn = idb.connect(_db_path_from_request(request))
     try:
-        idb.opportunistic_sweep(conn)
-        idb.ensure_user(conn, uid)
-        r = idb.upsert_memory(conn, uid, key, val, tier=2, actor="admin")
-        conn.commit()
-        return MemoryWriteResponse(**r)
+        u = idb.resolve_or_create_user_for_session(conn, session_id=sid)
+        items = idb.list_memory_entries(conn, user_id=int(u["user_id"]), tier=(int(tier) if tier is not None else None))
+        return {"items": items, "meta": {"count": len(items), "tier": tier}}
     finally:
         conn.close()
 
+
+@admin_memory_router.get("")
+def list_memory_admin(
+    request: Request,
+    tier: Optional[int] = Query(default=None),
+    user_id: Optional[int] = Query(default=None),
+) -> Dict[str, Any]:
+    _require_identity_memory_active()
+
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="user_id is required for admin memory listing")
+
+    conn = idb.connect(_db_path_from_request(request))
+    try:
+        items = idb.list_memory_entries(conn, user_id=int(user_id), tier=(int(tier) if tier is not None else None))
+        return {"items": items, "meta": {"count": len(items), "tier": tier, "user_id": int(user_id)}}
+    finally:
+        conn.close()
+
+
+@memory_router.post("/proposals")
+def propose_memory_write(
+    request: Request,
+    body: Dict[str, Any] = Body(...),
+) -> Dict[str, Any]:
+    _require_identity_memory_active()
+
+    # Payload per locked API: user_id, tier, type, value, reason
+    tier = int(body.get("tier") or 0)
+    if tier not in (1, 2):
+        raise HTTPException(status_code=400, detail="tier must be 1 or 2")
+
+    type_ = str(body.get("type") or "").strip()
+    value = body.get("value")
+    reason = str(body.get("reason") or "").strip()
+
+    if not type_:
+        raise HTTPException(status_code=400, detail="type is required")
+    if value is None:
+        raise HTTPException(status_code=400, detail="value is required")
+    if not reason:
+        raise HTTPException(status_code=400, detail="reason is required")
+
+    # Determine target user:
+    # - If caller provided user_id, use it only on admin router (not here). For user router, derive from session.
+    sid = (request.headers.get("X-ALICE-SESSION-ID") or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="X-ALICE-SESSION-ID header is required")
+
+    conn = idb.connect(_db_path_from_request(request))
+    try:
+        u = idb.resolve_or_create_user_for_session(conn, session_id=sid)
+        requires_admin = (tier == 2)
+        value_json = value if isinstance(value, dict) else {"value": value}
+        value_text = str(value) if not isinstance(value, str) else value
+        proposal = idb.create_memory_proposal(
+            conn,
+            user_id=int(u["user_id"]),
+            tier=tier,
+            type_=type_,
+            value_json=value_json,
+            value_text=value_text,
+            reason=reason,
+            requires_admin=requires_admin,
+        )
+        conn.commit()
+        return proposal
+    finally:
+        conn.close()
+
+
+@memory_router.post("/proposals/{proposal_id}/confirm")
+def confirm_proposal(
+    request: Request,
+    proposal_id: str,
+    body: Dict[str, Any] = Body(...),
+) -> Dict[str, Any]:
+    _require_identity_memory_active()
+
+    if body.get("confirm") is not True:
+        raise HTTPException(status_code=400, detail="confirm=true is required")
+
+    # Determine actor type:
+    # - Tier 1 confirmations are user
+    # - Tier 2 confirmations must be admin, enforced by mounting this endpoint also under admin router in main.py if desired.
+    conn = idb.connect(_db_path_from_request(request))
+    try:
+        prop = idb.get_proposal(conn, proposal_id)
+        if not prop:
+            raise HTTPException(status_code=404, detail="Proposal not found")
+
+        # Expiry check
+        try:
+            exp = prop["expires_at"]
+            if exp and exp <= idb.utc_now_iso():
+                idb.mark_proposal_status(conn, proposal_id, status="expired")
+                conn.commit()
+                raise HTTPException(status_code=409, detail="Proposal expired")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+        if prop["status"] != "pending":
+            raise HTTPException(status_code=409, detail=f"Proposal is not pending (status={prop['status']})")
+
+        tier = int(prop["tier"])
+        created_by = "user" if tier == 1 else "admin"
+
+        # If Tier 2, require admin router in practice. Here we hard-enforce by checking for X-ISAC-ADMIN-TOKEN presence,
+        # but do not validate it here (validation happens in main.py require_admin_if_configured dependency).
+        if tier == 2:
+            admin_token = (request.headers.get("X-ISAC-ADMIN-TOKEN") or "").strip()
+            admin_key = (request.headers.get("X-ISAC-ADMIN-KEY") or "").strip()
+            if not (admin_token or admin_key):
+                raise HTTPException(status_code=401, detail="Admin confirmation required for Tier 2")
+
+        mid = idb.create_memory_entry_from_proposal(conn, proposal=prop, created_by=created_by)
+        idb.mark_proposal_status(conn, proposal_id, status="confirmed", ts_field="confirmed_at")
+        conn.commit()
+        return {"ok": True, "memory_id": mid, "proposal_id": proposal_id}
+    finally:
+        conn.close()
+
+
+@memory_router.post("/proposals/{proposal_id}/reject")
+def reject_proposal(
+    request: Request,
+    proposal_id: str,
+) -> Dict[str, Any]:
+    _require_identity_memory_active()
+
+    conn = idb.connect(_db_path_from_request(request))
+    try:
+        prop = idb.get_proposal(conn, proposal_id)
+        if not prop:
+            raise HTTPException(status_code=404, detail="Proposal not found")
+        if prop["status"] != "pending":
+            raise HTTPException(status_code=409, detail=f"Proposal is not pending (status={prop['status']})")
+        idb.mark_proposal_status(conn, proposal_id, status="rejected", ts_field="rejected_at")
+        conn.commit()
+        return {"ok": True, "proposal_id": proposal_id, "status": "rejected"}
+    finally:
+        conn.close()
+
+
+@memory_router.delete("/{memory_id}")
+def forget_memory(
+    request: Request,
+    memory_id: int,
+) -> Dict[str, Any]:
+    _require_identity_memory_active()
+
+    # Tier enforcement:
+    # - Tier 1: user can delete
+    # - Tier 2: admin required
+    conn = idb.connect(_db_path_from_request(request))
+    try:
+        row = conn.execute(
+            "SELECT tier FROM memory_entries WHERE id = ? AND is_deleted = 0",
+            (int(memory_id),),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Memory not found")
+
+        tier = int(row["tier"])
+        if tier == 2:
+            admin_token = (request.headers.get("X-ISAC-ADMIN-TOKEN") or "").strip()
+            admin_key = (request.headers.get("X-ISAC-ADMIN-KEY") or "").strip()
+            if not (admin_token or admin_key):
+                raise HTTPException(status_code=401, detail="Admin required to delete Tier 2 memory")
+
+        ok = idb.delete_memory_entry(conn, memory_id=int(memory_id), actor=("admin" if tier == 2 else "user"), actor_user_id=None)
+        conn.commit()
+        return {"ok": True, "deleted": bool(ok), "memory_id": int(memory_id)}
+    finally:
+        conn.close()
+
+
+# ----------------------------
+# Admin Inbox
+# ----------------------------
 
 @admin_inbox_router.get("/inbox")
-def inbox(request: Request, limit: int = Query(50, ge=1, le=200), include_ack: bool = Query(False)) -> Dict[str, Any]:
-    conn = _with_conn(request)
+def list_inbox(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    include_acked: bool = Query(default=False),
+) -> Dict[str, Any]:
+    _require_identity_memory_active()
+
+    conn = idb.connect(_db_path_from_request(request))
     try:
-        idb.opportunistic_sweep(conn)
-        items = idb.admin_inbox_list(conn, limit=limit, include_ack=bool(include_ack))
-        conn.commit()
-        return {"status": "ok", "count": len(items), "items": items}
+        items = idb.list_admin_inbox(conn, limit=int(limit), include_acked=bool(include_acked))
+        return {"items": items, "meta": {"count": len(items), "limit": int(limit), "include_acked": bool(include_acked)}}
     finally:
         conn.close()
 
 
-@admin_inbox_router.post("/inbox/{inbox_id}/ack")
-def inbox_ack(request: Request, inbox_id: int) -> Dict[str, Any]:
-    conn = _with_conn(request)
+@admin_inbox_router.post("/inbox/{event_id}/ack")
+def ack_inbox(
+    request: Request,
+    event_id: str,
+) -> Dict[str, Any]:
+    _require_identity_memory_active()
+
+    conn = idb.connect(_db_path_from_request(request))
     try:
-        ok = idb.admin_inbox_ack(conn, inbox_id)
+        ok = idb.ack_admin_inbox_event(conn, event_id=event_id, acked_by_user_id=None)
         conn.commit()
-        return {"status": "ok", "acknowledged": bool(ok), "id": int(inbox_id)}
+        return {"ok": True, "acked": bool(ok), "event_id": event_id}
     finally:
         conn.close()
 
 
-@admin_inbox_router.post("/sweep/run")
-def sweep_run(request: Request) -> Dict[str, Any]:
-    conn = _with_conn(request)
+# ----------------------------
+# Audit (read-only, admin-gated by main.py dependencies)
+# ----------------------------
+
+@audit_router.get("/identity")
+def audit_identity(request: Request, limit: int = Query(default=200, ge=1, le=500)) -> Dict[str, Any]:
+    _require_identity_memory_active()
+    conn = idb.connect(_db_path_from_request(request))
     try:
-        res = idb.opportunistic_sweep(conn, min_interval_seconds=0)
-        conn.commit()
-        return {"status": "ok", "result": res}
+        items = idb.list_audit(conn, domain="identity", limit=int(limit))
+        return {"items": items, "meta": {"count": len(items), "limit": int(limit)}}
+    finally:
+        conn.close()
+
+@audit_router.get("/memory")
+def audit_memory(request: Request, limit: int = Query(default=200, ge=1, le=500)) -> Dict[str, Any]:
+    _require_identity_memory_active()
+    conn = idb.connect(_db_path_from_request(request))
+    try:
+        items = idb.list_audit(conn, domain="memory", limit=int(limit))
+        return {"items": items, "meta": {"count": len(items), "limit": int(limit)}}
     finally:
         conn.close()

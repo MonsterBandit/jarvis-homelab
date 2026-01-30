@@ -65,9 +65,27 @@ def _sandbox_guard(x_isac_sandbox: Optional[str] = Header(default=None, alias="X
                 "next_allowed": ["exit_sandbox", "discard_sandbox", "summarize_sandbox"],
             },
         )
-router = APIRouter(prefix="/alice/memory", tags=["Alice Memory"], dependencies=[Depends(_sandbox_guard)])
+def _lap_memory_inactive_guard() -> None:
+    """
+    LAP guard (LOCKED):
+    - During the Last Administrative Phase, memory exists only as architecture and constraints.
+    - No memory reads or writes are permitted via this legacy Alice Memory surface.
+    - This endpoint family remains present for future migration, but is inert now.
+    """
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "ok": False,
+            "error": "MEMORY_INACTIVE",
+            "blocked": True,
+            "blocked_surface": "alice.memory",
+            "message": "Memory is not active during the Last Administrative Phase (LAP).",
+            "phase": "LAP",
+            "next_allowed": ["continue_lap_implementation", "activate_memory_later_with_admin"],
+        },
+    )
 
-
+router = APIRouter(prefix="/alice/memory", tags=["Alice Memory"], dependencies=[Depends(_sandbox_guard), Depends(_lap_memory_inactive_guard)])
 # ---------------------------------------------------------------------
 # DB / schema helpers
 # ---------------------------------------------------------------------

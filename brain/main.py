@@ -11,6 +11,7 @@ import sqlite3
 import time
 import secrets
 import hmac
+from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -915,7 +916,8 @@ def init_db() -> None:
             """
         )
 
-        conn.commit()
+
+        # -------------------------------------------------
     finally:
         conn.close()
 
@@ -944,7 +946,8 @@ def lineage_init(task_id: int, parent_task_id: Optional[int] = None, trigger_rea
             """,
             (task_id, now),
         )
-        conn.commit()
+
+        # -------------------------------------------------
     finally:
         conn.close()
 
@@ -973,7 +976,6 @@ def timing_mark_started(task_id: int) -> None:
     finally:
         conn.close()
 
-
 def timing_mark_finished(task_id: int) -> None:
     now = datetime.now(timezone.utc).isoformat()
     conn = _db_connect()
@@ -994,7 +996,8 @@ def timing_mark_finished(task_id: int) -> None:
             """,
             (now, task_id),
         )
-        conn.commit()
+
+        # -------------------------------------------------
     finally:
         conn.close()
 
@@ -1010,7 +1013,8 @@ def failures_record(task_id: int, step_id: Optional[int], failure_class: str, me
             """,
             (task_id, step_id, failure_class, message[:5000], now),
         )
-        conn.commit()
+
+        # -------------------------------------------------
     finally:
         conn.close()
 
@@ -1041,7 +1045,8 @@ def lineage_inc_verify_failures(task_id: int) -> int:
             """,
             (now, task_id),
         )
-        conn.commit()
+
+        # -------------------------------------------------
         return lineage_get_verify_failures(task_id)
     finally:
         conn.close()
@@ -1065,7 +1070,8 @@ def log_conversation(model: str, user_message: str, jarvis_answer: str) -> None:
                 jarvis_answer,
             ),
         )
-        conn.commit()
+
+        # -------------------------------------------------
     finally:
         conn.close()
 
@@ -1129,7 +1135,8 @@ def add_shopping_list_item(
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
-        conn.commit()
+
+        # -------------------------------------------------
         return int(cur.lastrowid)
     finally:
         conn.close()
@@ -1209,7 +1216,8 @@ def delete_shopping_list_item(household: str, item_id: int) -> bool:
             """,
             (household, item_id),
         )
-        conn.commit()
+
+        # -------------------------------------------------
         return cur.rowcount > 0
     finally:
         conn.close()
@@ -1230,7 +1238,8 @@ def clear_shopping_list(household: str) -> int:
             """,
             (household,),
         )
-        conn.commit()
+
+        # -------------------------------------------------
         return cur.rowcount
     finally:
         conn.close()
@@ -3074,7 +3083,8 @@ def _task_update_status(task_id: int, status: str) -> None:
             """,
             (status, task_id),
         )
-        conn.commit()
+
+        # -------------------------------------------------
         if cur.rowcount < 1:
             raise HTTPException(status_code=404, detail="Task not found")
     finally:
@@ -3689,6 +3699,445 @@ def okd_approve_observation_plan(task_id: int, request: Request) -> Dict[str, An
 
     return {"ok": True, "task_id": task_id, "approved": True}
 
+
+
+
+# ---------------------------------------------------------
+# LAP — "ALICE, FIX IT" Protocol (ACTIVE)
+# Universal protocol, backend-enforced, fail-closed.
+#
+# Canonical phases:
+#   Evidence -> Proposal -> Human Confirm -> Execute
+#
+# Notes:
+# - This is a protocol surface, not autonomy. Alice still only responds to explicit user intent.
+# - Execution is admin-gated and must obey global blocks (finance remains blocked unless explicitly lifted).
+# - No background jobs, no silent retries, no scope expansion mid-flight.
+# ---------------------------------------------------------
+
+class FixItAdvanceRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=8000)
+    case_id: Optional[int] = None
+    domain: Optional[str] = Field(None, max_length=64)
+    scope: Optional[Dict[str, Any]] = None
+
+
+class FixItConfirmRequest(BaseModel):
+    proposal_hash: str = Field(..., min_length=8, max_length=128)
+
+
+class FixItExecuteRequest(BaseModel):
+    proposal_hash: str = Field(..., min_length=8, max_length=128)
+    dry_run: Optional[bool] = None
+
+
+def _fix_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _fix_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _fix_hash(obj: Any) -> str:
+    raw = json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _fix_create_case(*, title: str, domain: str, scope: Optional[Dict[str, Any]]) -> int:
+    now = _fix_now()
+    scope_json = json.dumps(scope or {}, ensure_ascii=False)
+    with _fix_db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO fix_cases (title, domain, scope_json, status, created_at, updated_at)
+            VALUES (?, ?, ?, 'open', ?, ?)
+            """,
+            (title, domain, scope_json, now, now),
+        )
+        return int(cur.lastrowid)
+
+
+def _fix_add_event(case_id: int, kind: str, payload: Dict[str, Any]) -> None:
+    now = _fix_now()
+    with _fix_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO fix_events (case_id, kind, payload_json, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (int(case_id), str(kind), json.dumps(payload or {}, ensure_ascii=False), now),
+        )
+
+
+def _fix_get_case(case_id: int) -> Dict[str, Any]:
+    with _fix_db() as conn:
+        row = conn.execute(
+            """
+            SELECT id, title, domain, scope_json, status, created_at, updated_at
+            FROM fix_cases
+            WHERE id = ?
+            """,
+            (int(case_id),),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Fix-It case not found")
+        d = dict(row)
+        try:
+            d["scope"] = json.loads(d.get("scope_json") or "{}")
+        except Exception:
+            d["scope"] = {}
+        return d
+
+
+def _fix_list_recent_events(case_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+    with _fix_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT kind, payload_json, created_at
+            FROM fix_events
+            WHERE case_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(case_id), int(limit)),
+        ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in reversed(rows or []):
+        try:
+            payload = json.loads(r["payload_json"] or "{}")
+        except Exception:
+            payload = {}
+        out.append({"kind": r["kind"], "payload": payload, "created_at": r["created_at"]})
+    return out
+
+
+def _fix_store_proposal(case_id: int, proposal_obj: Dict[str, Any]) -> str:
+    pid = str(uuid4())
+    now = _fix_now()
+    ph = _fix_hash(proposal_obj)
+    with _fix_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO fix_proposals (id, case_id, proposal_hash, proposal_json, status, created_at, confirmed_at)
+            VALUES (?, ?, ?, ?, 'proposed', ?, NULL)
+            """,
+            (pid, int(case_id), ph, json.dumps(proposal_obj, ensure_ascii=False), now),
+        )
+    return ph
+
+
+def _fix_mark_confirmed(case_id: int, proposal_hash: str, confirmed_by: str) -> None:
+    now = _fix_now()
+    with _fix_db() as conn:
+        # Ensure proposal exists
+        row = conn.execute(
+            """
+            SELECT id, status
+            FROM fix_proposals
+            WHERE case_id = ? AND proposal_hash = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (int(case_id), proposal_hash),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Proposal not found for this case")
+        if str(row["status"]) == "confirmed":
+            return
+
+        conn.execute(
+            """
+            UPDATE fix_proposals
+            SET status='confirmed', confirmed_at=?
+            WHERE case_id = ? AND proposal_hash = ?
+            """,
+            (now, int(case_id), proposal_hash),
+        )
+        conn.execute(
+            """
+            INSERT INTO fix_confirmations (case_id, proposal_hash, confirmed_by, confirmed_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (int(case_id), proposal_hash, confirmed_by, now),
+        )
+
+
+def _fix_get_confirmed_proposal(case_id: int, proposal_hash: str) -> Dict[str, Any]:
+    with _fix_db() as conn:
+        row = conn.execute(
+            """
+            SELECT proposal_json, status
+            FROM fix_proposals
+            WHERE case_id = ? AND proposal_hash = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (int(case_id), proposal_hash),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Proposal not found")
+        if str(row["status"]) != "confirmed":
+            raise HTTPException(status_code=409, detail="Proposal is not confirmed")
+        try:
+            return json.loads(row["proposal_json"] or "{}")
+        except Exception:
+            return {}
+
+
+_FIXIT_SYSTEM = """You are Alice. You are operating under the 'ALICE, FIX IT' protocol.
+
+Hard rules:
+- Output MUST be a single JSON object and nothing else.
+- Do not claim you executed anything.
+- Do not mention ISAC.
+- Do not propose finance execution. Finance is blocked for execution.
+- No scope expansion. Stay within the user's stated intent and provided case scope.
+- Prefer clarification over guessing.
+
+Protocol phases:
+1) evidence: ask ONE clarifying question OR summarize evidence gathered from the provided context.
+2) proposal: propose 1-3 candidate fixes with bounded scope, risks, rollback concept, and verify plan.
+3) confirm: instruct the human exactly what to confirm (proposal_hash will be computed server-side).
+4) execute_ready: only when the human has explicitly confirmed a proposal and execution plan is concrete.
+
+JSON shape:
+{
+  "phase": "evidence" | "proposal" | "confirm" | "execute_ready",
+  "one_question": string | null,
+  "evidence_summary": string | null,
+  "proposals": [
+    {
+      "title": string,
+      "summary": string,
+      "scope": string,
+      "risk": string,
+      "rollback": string,
+      "verify": string,
+      "execution_plan": {
+        "ops": [
+          {"op":"file_replace","path":"/opt/jarvis/data/index.html","content_utf8":"..."},
+          {"op":"file_replace","path":"/opt/jarvis/brain/main.py","content_utf8":"..."}
+        ]
+      }
+    }
+  ],
+  "notes": string | null
+}
+
+Only include execution_plan if you are confident it is correct and fully bounded to allowlisted paths.
+"""
+
+
+@app.post(
+    "/fixit/advance",
+    dependencies=[Depends(require_api_key)],
+)
+async def fixit_advance(request: Request, body: FixItAdvanceRequest) -> Dict[str, Any]:
+    if _is_sandbox_request(request):
+        _sandbox_boundary_http("fixit.advance")
+
+    msg = (body.message or "").strip()
+    if not msg:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    # Establish or load case
+    case_id = body.case_id
+    if case_id is None:
+        domain = (body.domain or "ops").strip() or "ops"
+        title = msg[:80]
+        case_id = _fix_create_case(title=title, domain=domain, scope=body.scope)
+        _fix_add_event(case_id, "case_created", {"title": title, "domain": domain, "scope": body.scope or {}})
+
+    case = _fix_get_case(int(case_id))
+
+    # Record user message as an event (audit trail)
+    _fix_add_event(int(case_id), "user_message", {"message": msg})
+
+    # Build short context for the model
+    events = _fix_list_recent_events(int(case_id), limit=18)
+    ctx_blob = {
+        "case": {
+            "id": case["id"],
+            "title": case["title"],
+            "domain": case["domain"],
+            "status": case["status"],
+            "scope": case.get("scope") or {},
+        },
+        "recent_events": events,
+    }
+
+    messages = [
+        {"role": "system", "content": _FIXIT_SYSTEM},
+        {"role": "user", "content": json.dumps({"input_message": msg, "context": ctx_blob}, ensure_ascii=False)},
+    ]
+
+    try:
+        answer = await MODEL_CLIENT.generate_chat_completion(
+            model=LLM_MODEL,
+            messages=messages,
+            temperature=0.2,
+            max_output_tokens=1200,
+        )
+    except ModelClientError as exc:
+        raise HTTPException(status_code=500, detail=f"Error from LLM provider: {exc}") from exc
+
+    # Parse strict JSON
+    try:
+        obj = json.loads((answer or "").strip())
+        if not isinstance(obj, dict):
+            raise ValueError("not a dict")
+    except Exception:
+        _fix_add_event(int(case_id), "model_parse_error", {"raw": (answer or "")[:2000]})
+        return {
+            "ok": False,
+            "case_id": int(case_id),
+            "phase": "evidence",
+            "one_question": "I couldn’t parse my own Fix-It output. Can you repeat the request in one sentence and name the target file(s) if you know them?",
+            "evidence_summary": None,
+            "proposals": [],
+            "needs_confirmation": False,
+            "notes": None,
+        }
+
+    phase = str(obj.get("phase") or "evidence").strip()
+    one_q = obj.get("one_question")
+    ev = obj.get("evidence_summary")
+    props = obj.get("proposals") or []
+    notes = obj.get("notes")
+
+    if not isinstance(props, list):
+        props = []
+
+    stored: List[Dict[str, Any]] = []
+    proposal_hashes: List[str] = []
+
+    # Store proposals (server computes hashes)
+    for p in props[:3]:
+        if not isinstance(p, dict):
+            continue
+        ph = _fix_store_proposal(int(case_id), p)
+        proposal_hashes.append(ph)
+        stored.append({
+            "proposal_hash": ph,
+            "title": str(p.get("title") or "Proposal"),
+            "summary": str(p.get("summary") or ""),
+            "scope": str(p.get("scope") or ""),
+            "risk": str(p.get("risk") or ""),
+            "rollback": str(p.get("rollback") or ""),
+            "verify": str(p.get("verify") or ""),
+        })
+
+    _fix_add_event(int(case_id), "model_response", {"phase": phase, "one_question": one_q, "evidence_summary": ev, "proposal_hashes": proposal_hashes})
+
+    needs_confirmation = bool(stored)
+
+    return {
+        "ok": True,
+        "case_id": int(case_id),
+        "phase": phase,
+        "one_question": one_q,
+        "evidence_summary": ev,
+        "proposals": stored,
+        "needs_confirmation": needs_confirmation,
+        "notes": notes,
+    }
+
+
+@app.post(
+    "/fixit/{case_id}/confirm",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+def fixit_confirm(case_id: int, body: FixItConfirmRequest, request: Request) -> Dict[str, Any]:
+    if case_id < 1:
+        raise HTTPException(status_code=400, detail="case_id must be >= 1")
+
+    ph = (body.proposal_hash or "").strip()
+    if not ph:
+        raise HTTPException(status_code=400, detail="proposal_hash is required")
+
+    confirmed_by = request.headers.get("X-ISAC-USER-ID") or "admin"
+    _fix_mark_confirmed(case_id, ph, confirmed_by=str(confirmed_by))
+
+    _fix_add_event(case_id, "proposal_confirmed", {"proposal_hash": ph, "confirmed_by": confirmed_by})
+
+    return {"ok": True, "case_id": int(case_id), "proposal_hash": ph, "status": "confirmed"}
+
+
+@app.post(
+    "/fixit/{case_id}/execute",
+    dependencies=[Depends(require_api_key), Depends(require_admin_if_configured)],
+)
+async def fixit_execute(case_id: int, body: FixItExecuteRequest, request: Request) -> Dict[str, Any]:
+    if _is_sandbox_request(request):
+        _sandbox_boundary_http("fixit.execute")
+
+    if case_id < 1:
+        raise HTTPException(status_code=400, detail="case_id must be >= 1")
+
+    case = _fix_get_case(case_id)
+    if case.get("domain") == "finance":
+        # Finance execution remains globally blocked unless explicitly lifted elsewhere.
+        raise HTTPException(status_code=403, detail="Finance execution is blocked")
+
+    ph = (body.proposal_hash or "").strip()
+    if not ph:
+        raise HTTPException(status_code=400, detail="proposal_hash is required")
+
+    proposal = _fix_get_confirmed_proposal(case_id, ph)
+    plan = (proposal.get("execution_plan") or {}) if isinstance(proposal, dict) else {}
+    ops = plan.get("ops") if isinstance(plan, dict) else None
+    if not isinstance(ops, list) or not ops:
+        raise HTTPException(status_code=400, detail="No executable ops found in proposal (execution_plan.ops missing)")
+
+    # Dry-run default policy: prefer dry-run unless explicitly overridden.
+    effective_dry_run = ISAC_DRY_RUN_DEFAULT if body.dry_run is None else bool(body.dry_run)
+
+    # Execute ops by creating file_replace tasks (allowlist + enforcement happens downstream)
+    results: List[Dict[str, Any]] = []
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        if str(op.get("op") or "") != "file_replace":
+            results.append({"ok": False, "error": "unsupported_op", "op": op.get("op")})
+            continue
+
+        path = str(op.get("path") or "").strip()
+        content = op.get("content_utf8")
+        if not path or content is None:
+            results.append({"ok": False, "error": "missing_path_or_content"})
+            continue
+
+        if not _is_path_allowed(path):
+            results.append({"ok": False, "error": "path_not_allowlisted", "path": path})
+            continue
+
+        # Create file_replace task
+        raw = str(content).encode("utf-8")
+        content_b64 = base64.b64encode(raw).decode("utf-8")
+
+        req = FileWriteTaskCreateRequest(
+            path=path,
+            content_b64=content_b64,
+            dry_run=effective_dry_run,
+            parent_task_id=None,
+            trigger_reason=f"fixit:{case_id}:{ph[:8]}",
+        )
+        created = create_file_replace_task(req)
+        task_id = int(created.get("task_id"))
+
+        # Optionally auto-resume immediately if not dry-run?
+        # We still run resume for both dry-run and real, because resume performs verify and marks completion.
+        resumed = await resume_task(task_id, request)
+
+        results.append({"ok": True, "task_id": task_id, "dry_run": effective_dry_run, "resume": resumed})
+
+    _fix_add_event(case_id, "execute_attempted", {"proposal_hash": ph, "dry_run": effective_dry_run, "results": [{"task_id": r.get("task_id"), "ok": r.get("ok")} for r in results]})
+
+    return {"ok": True, "case_id": int(case_id), "proposal_hash": ph, "dry_run": effective_dry_run, "results": results}
 
 
 @app.post(
